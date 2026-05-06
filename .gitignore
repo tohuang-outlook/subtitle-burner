@@ -5,3 +5,5 @@
 *.app/Contents/_CodeSignature/
 SubtitleBurner.app/Contents/Resources/bin/
 HandBrakeCLI
+MediaDownloaderIcon-1024.png
+MediaDownloaderIcon.iconset/
