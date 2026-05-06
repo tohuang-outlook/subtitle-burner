@@ -11,6 +11,8 @@
   <string>Subtitle Burner</string>
   <key>CFBundleDisplayName</key>
   <string>Subtitle Burner</string>
+  <key>CFBundleIconFile</key>
+  <string>SubtitleBurnerIcon</string>
   <key>CFBundlePackageType</key>
   <string>APPL</string>
   <key>CFBundleShortVersionString</key>
