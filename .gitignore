@@ -2,6 +2,6 @@
 .clang-module-cache/
 .pycache/
 *.xcuserstate
-SubtitleBurner.app/Contents/_CodeSignature/
+*.app/Contents/_CodeSignature/
 SubtitleBurner.app/Contents/Resources/bin/
 HandBrakeCLI

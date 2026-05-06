@@ -1,5 +1,45 @@
 # Subtitle Burner
 
+This repo contains two small native macOS tools:
+
+- `SubtitleBurner.app`: generate bilingual subtitles and burn them into video.
+- `MediaDownloader.app`: download YouTube/Instagram media with `yt-dlp`, save MP4/MP3, and optionally resize MP4 output.
+
+## Media Downloader
+
+Open:
+
+```bash
+open /Users/tonyhuang/Documents/Codex/2026-05-02/video-work/MediaDownloader.app
+```
+
+Features:
+
+- Paste a YouTube or Instagram URL
+- Download as `MP4 video` or `MP3 audio`
+- Choose download size: `Best`, `1080p`, `720p`, `480p`, `360p`
+- Optionally convert downloaded MP4 to `1080p`, `720p`, `480p`, `360p`, or a custom width
+- Optional browser cookies: Safari, Chrome, Firefox
+
+Required tools:
+
+```bash
+yt-dlp --version
+ffmpeg -version
+```
+
+If Instagram or YouTube asks for login, choose the browser cookies option that matches the browser where you are already logged in.
+
+Build:
+
+```bash
+./build_media_downloader.sh
+```
+
+Use only for media you own, have permission to download, or that the platform allows you to save.
+
+---
+
 本資料夾裡的 `SubtitleBurner.app` 是一個原生 macOS 小工具，會依照你的流程處理影片：
 
 1. `.mov` / `.mp4` 轉成 H.264 + AAC `.mp4`
