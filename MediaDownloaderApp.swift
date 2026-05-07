@@ -53,7 +53,7 @@ final class MediaDownloaderDelegate: NSObject, NSApplicationDelegate {
         customWidthField.placeholderString = "e.g. 1280"
         customWidthField.stringValue = ""
 
-        formatPopup.addItems(withTitles: ["MP4 video", "MP3 audio"])
+        formatPopup.addItems(withTitles: ["MP4 video", "MP3 audio", "Photo"])
         downloadSizePopup.addItems(withTitles: ["Best", "1080p", "720p", "480p", "360p"])
         convertSizePopup.addItems(withTitles: ["No conversion", "1080p", "720p", "480p", "360p", "Custom width"])
         cookiesPopup.addItems(withTitles: ["No browser cookies", "Safari cookies", "Chrome cookies", "Firefox cookies"])
@@ -206,8 +206,11 @@ final class MediaDownloaderDelegate: NSObject, NSApplicationDelegate {
 
         if mode == "MP3 audio" {
             args.append(contentsOf: ["-x", "--audio-format", "mp3", "--audio-quality", "0"])
-        } else {
+        } else if mode == "MP4 video" {
             args.append(contentsOf: ["--merge-output-format", "mp4", "-f", videoFormat()])
+        } else {
+            args.append(contentsOf: ["--write-info-json"])
+            log("Photo mode selected. yt-dlp will download the original image media when the URL provides photos.")
         }
         args.append(sourceURL)
 
