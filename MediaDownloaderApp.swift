@@ -6,11 +6,13 @@ final class MediaDownloaderDelegate: NSObject, NSApplicationDelegate {
     let urlField = NSTextField()
     let outputField = NSTextField()
     let ytdlpField = NSTextField()
+    let galleryDLField = NSTextField()
     let ffmpegField = NSTextField()
     let formatPopup = NSPopUpButton()
     let downloadSizePopup = NSPopUpButton()
     let convertSizePopup = NSPopUpButton()
     let customWidthField = NSTextField()
+    let igIndexesField = NSTextField()
     let cookiesPopup = NSPopUpButton()
     let logView = NSTextView()
     var running = false
@@ -49,9 +51,12 @@ final class MediaDownloaderDelegate: NSObject, NSApplicationDelegate {
         urlField.placeholderString = "Paste YouTube or Instagram URL"
         outputField.stringValue = "\(NSHomeDirectory())/Downloads"
         ytdlpField.stringValue = findTool("yt-dlp")
+        galleryDLField.stringValue = findTool("gallery-dl")
         ffmpegField.stringValue = findTool("ffmpeg")
         customWidthField.placeholderString = "e.g. 1280"
         customWidthField.stringValue = ""
+        igIndexesField.placeholderString = "all, 1, 1,3,5, or 2-8"
+        igIndexesField.stringValue = "all"
 
         formatPopup.addItems(withTitles: ["Youtube MP4", "Youtube MP3", "IG video", "IG photo"])
         downloadSizePopup.addItems(withTitles: ["Best", "1080p", "720p", "480p", "360p"])
@@ -64,9 +69,11 @@ final class MediaDownloaderDelegate: NSObject, NSApplicationDelegate {
         root.addArrangedSubview(popupRow("Download size", downloadSizePopup))
         root.addArrangedSubview(popupRow("Convert MP4 to", convertSizePopup))
         root.addArrangedSubview(row("Custom width", customWidthField, "Clear", #selector(clearCustomWidth)))
+        root.addArrangedSubview(row("IG indexes", igIndexesField, "List", #selector(listIGIndexes)))
         root.addArrangedSubview(popupRow("Cookies", cookiesPopup))
         root.addArrangedSubview(separator())
         root.addArrangedSubview(row("yt-dlp", ytdlpField, "Find", #selector(chooseYTDLP)))
+        root.addArrangedSubview(row("gallery-dl", galleryDLField, "Find", #selector(chooseGalleryDL)))
         root.addArrangedSubview(row("ffmpeg", ffmpegField, "Find", #selector(chooseFFmpeg)))
 
         let buttons = NSStackView()
@@ -144,6 +151,12 @@ final class MediaDownloaderDelegate: NSObject, NSApplicationDelegate {
         customWidthField.stringValue = ""
     }
 
+    @objc func listIGIndexes() {
+        start {
+            try self.performListIGIndexes()
+        }
+    }
+
     @objc func chooseOutput() {
         let panel = NSOpenPanel()
         panel.canChooseDirectories = true
@@ -154,6 +167,7 @@ final class MediaDownloaderDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc func chooseYTDLP() { chooseFile(into: ytdlpField) }
+    @objc func chooseGalleryDL() { chooseFile(into: galleryDLField) }
     @objc func chooseFFmpeg() { chooseFile(into: ffmpegField) }
 
     func chooseFile(into field: NSTextField) {
@@ -168,13 +182,16 @@ final class MediaDownloaderDelegate: NSObject, NSApplicationDelegate {
         start {
             for (name, path) in [
                 ("yt-dlp", self.text(self.ytdlpField)),
+                ("gallery-dl", self.text(self.galleryDLField)),
                 ("ffmpeg", self.text(self.ffmpegField))
             ] {
                 self.log("\(name): \(FileManager.default.isExecutableFile(atPath: path) ? "OK" : "Missing") \(path)")
             }
             let ytdlp = try self.requireTool(self.text(self.ytdlpField), "yt-dlp")
+            let galleryDL = try self.requireTool(self.text(self.galleryDLField), "gallery-dl")
             let ffmpeg = try self.requireTool(self.text(self.ffmpegField), "ffmpeg")
             self.log("yt-dlp version: \(try self.capture([ytdlp, "--version"]).trimmingCharacters(in: .whitespacesAndNewlines))")
+            self.log("gallery-dl version: \(try self.capture([galleryDL, "--version"]).trimmingCharacters(in: .whitespacesAndNewlines))")
             let ffmpegVersion = try self.capture([ffmpeg, "-hide_banner", "-version"])
             self.log(ffmpegVersion.split(whereSeparator: \.isNewline).first.map(String.init) ?? "ffmpeg OK")
         }
@@ -194,6 +211,11 @@ final class MediaDownloaderDelegate: NSObject, NSApplicationDelegate {
         guard !sourceURL.isEmpty else { throw message("Paste a YouTube or Instagram URL first.") }
 
         let mode = selected(formatPopup)
+        if mode == "IG photo" {
+            try performIGPhotoDownload(sourceURL: sourceURL, outputDir: outputDir)
+            return
+        }
+
         var args = [
             ytdlp,
             "--newline",
@@ -203,6 +225,7 @@ final class MediaDownloaderDelegate: NSObject, NSApplicationDelegate {
             "--print", "after_move:filepath"
         ]
         args.append(contentsOf: cookieArgs())
+        args.append(contentsOf: igPlaylistArgs(for: mode))
 
         switch mode {
         case "Youtube MP3":
@@ -212,11 +235,8 @@ final class MediaDownloaderDelegate: NSObject, NSApplicationDelegate {
             args.append(contentsOf: ["--merge-output-format", "mp4", "-f", youtubeVideoFormat()])
             log("Youtube MP4 mode selected. yt-dlp will download video using the selected size.")
         case "IG video":
-            args.append(contentsOf: ["--merge-output-format", "mp4", "-f", instagramVideoFormat()])
+            args.append(contentsOf: ["--ignore-errors", "--merge-output-format", "mp4", "-f", instagramVideoFormat()])
             log("IG video mode selected. yt-dlp will download Instagram video/reel media as MP4 when available.")
-        case "IG photo":
-            args.append(contentsOf: ["--skip-download", "--write-thumbnail", "--convert-thumbnails", "jpg"])
-            log("IG photo mode selected. yt-dlp will save Instagram photo media as JPG when available.")
         default:
             throw message("Choose a download mode first.")
         }
@@ -238,6 +258,90 @@ final class MediaDownloaderDelegate: NSObject, NSApplicationDelegate {
         if ["Youtube MP4", "IG video"].contains(mode), selected(convertSizePopup) != "No conversion" {
             let converted = try convertMP4(finalFile)
             log("Converted file: \(converted.path)")
+        }
+    }
+
+    func performIGPhotoDownload(sourceURL: String, outputDir: URL) throws {
+        let galleryDL = try requireTool(text(galleryDLField), "gallery-dl")
+        if cookieArgs().isEmpty {
+            log("IG photo mode selected without browser cookies. If IG says login required, choose cookies from a browser where you are logged in.")
+        }
+        let ranges = igGalleryRanges()
+        let rangeText = ranges.compactMap { $0 }.joined(separator: ",")
+        log("IG photo mode selected. gallery-dl will download Instagram photo media\(rangeText.isEmpty ? "" : " for index range \(rangeText)").")
+
+        var downloadedFiles: [URL] = []
+        var seen = Set<String>()
+        for range in ranges {
+            var args = [
+                galleryDL,
+                "--no-mtime",
+                "-D", outputDir.path,
+                "--Print", "after:{_path}"
+            ]
+            args.append(contentsOf: cookieArgs())
+            if let range {
+                args.append(contentsOf: ["--range", range])
+            } else {
+                args.append(contentsOf: ["--filter", "video_url is None"])
+            }
+            args.append(sourceURL)
+
+            let startedAt = Date()
+            let result = try runCollecting(args)
+            var files = findDownloadedFiles(in: result.lines)
+            if files.isEmpty {
+                files = recentFiles(in: outputDir, since: startedAt, mode: "IG photo")
+            }
+            for file in files where !seen.contains(file.path) {
+                seen.insert(file.path)
+                downloadedFiles.append(file)
+            }
+        }
+
+        guard !downloadedFiles.isEmpty else {
+            throw message("IG photo download finished, but I could not identify a JPG/PNG output file. Check the log and output folder.")
+        }
+        for file in downloadedFiles {
+            log("Downloaded file: \(file.path)")
+        }
+    }
+
+    func performListIGIndexes() throws {
+        let ytdlp = try requireTool(text(ytdlpField), "yt-dlp")
+        let sourceURL = text(urlField).trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !sourceURL.isEmpty else { throw message("Paste an Instagram URL first.") }
+        if !sourceURL.contains("instagram.com") {
+            log("This looks like a non-Instagram URL; index listing is meant for IG carousel posts.")
+        }
+        if cookieArgs().isEmpty {
+            log("Instagram often requires login. If this fails, choose Chrome/Safari/Firefox cookies where you are logged into IG.")
+        }
+        let args = [
+            ytdlp,
+            "--ignore-errors",
+            "--flat-playlist",
+            "--print",
+            "%(playlist_index)s/%(playlist_count)s  %(id)s  %(title)s"
+        ] + cookieArgs() + [sourceURL]
+        let result = try runCollecting(args, allowFailure: true)
+        let indexLines = result.lines.filter { line in
+            line.range(of: #"^\d+/\d+"#, options: .regularExpression) != nil
+        }
+        let parsed = indexLines.compactMap(parseIndexLine)
+        if let total = parsed.map(\.total).max() {
+            let videoIndexes = parsed.map(\.index).sorted()
+            let photoCandidates = Array(Set(1...total).subtracting(videoIndexes)).sorted()
+            log("IG carousel indexes detected: \(total)")
+            if !videoIndexes.isEmpty {
+                log("Likely video indexes: \(joinIndexes(videoIndexes))")
+            }
+            if !photoCandidates.isEmpty {
+                log("Likely photo indexes: \(joinIndexes(photoCandidates))")
+            }
+            log("Use IG indexes to download only what you want, for example: \(videoIndexes.first.map(String.init) ?? "1") or \(joinIndexes(Array(photoCandidates.prefix(3))))")
+        } else {
+            log("Could not detect index count from yt-dlp output. Check the log above.")
         }
     }
 
@@ -329,6 +433,31 @@ final class MediaDownloaderDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    func igPlaylistArgs(for mode: String) -> [String] {
+        guard mode == "IG video" else {
+            return []
+        }
+        if cookieArgs().isEmpty {
+            log("Instagram mode selected without browser cookies. If IG says login required, choose cookies from a browser where you are logged in.")
+        }
+        let raw = text(igIndexesField).trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !raw.isEmpty, raw.lowercased() != "all" else {
+            return []
+        }
+        return ["--playlist-items", raw]
+    }
+
+    func igGalleryRanges() -> [String?] {
+        let raw = text(igIndexesField).trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !raw.isEmpty, raw.lowercased() != "all" else {
+            return [nil]
+        }
+        return raw.split(separator: ",")
+            .map { String($0).trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+            .map { Optional($0) }
+    }
+
     func findDownloadedFiles(in lines: [String]) -> [URL] {
         var files: [URL] = []
         var seen = Set<String>()
@@ -416,7 +545,7 @@ final class MediaDownloaderDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    func runCollecting(_ args: [String]) throws -> (status: Int32, lines: [String]) {
+    func runCollecting(_ args: [String], allowFailure: Bool = false) throws -> (status: Int32, lines: [String]) {
         log("$ \(args.joined(separator: " "))")
         let process = Process()
         process.executableURL = URL(fileURLWithPath: args[0])
@@ -445,10 +574,26 @@ final class MediaDownloaderDelegate: NSObject, NSApplicationDelegate {
         lock.lock()
         let collected = lines
         lock.unlock()
-        if process.terminationStatus != 0 {
+        if process.terminationStatus != 0 && !allowFailure {
             throw message("Command failed with exit code \(process.terminationStatus): \(args[0])")
         }
         return (process.terminationStatus, collected)
+    }
+
+    func parseIndexLine(_ line: String) -> (index: Int, total: Int)? {
+        let parts = line.split(separator: " ", maxSplits: 1)
+        guard let first = parts.first else { return nil }
+        let indexParts = first.split(separator: "/")
+        guard indexParts.count == 2,
+              let index = Int(indexParts[0]),
+              let total = Int(indexParts[1]) else {
+            return nil
+        }
+        return (index, total)
+    }
+
+    func joinIndexes(_ indexes: [Int]) -> String {
+        indexes.map(String.init).joined(separator: ",")
     }
 
     func capture(_ args: [String]) throws -> String {

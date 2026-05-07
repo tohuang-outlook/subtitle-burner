@@ -3,7 +3,7 @@
 This repo contains two small native macOS tools:
 
 - `SubtitleBurner.app`: generate bilingual subtitles and burn them into video.
-- `MediaDownloader.app`: download YouTube/Instagram media with `yt-dlp`, save MP4/MP3, and optionally resize MP4 output.
+- `MediaDownloader.app`: download YouTube/Instagram media with `yt-dlp` and `gallery-dl`, save MP4/MP3/JPG, and optionally resize MP4 output.
 
 ## Media Downloader
 
@@ -26,12 +26,22 @@ Download modes:
 - `Youtube MP4`: downloads YouTube video as MP4 using the selected size.
 - `Youtube MP3`: extracts YouTube audio and saves MP3.
 - `IG video`: downloads Instagram video/reel media as MP4 when available.
-- `IG photo`: skips video download and saves Instagram photo media as JPG when available.
+- `IG photo`: uses `gallery-dl` to save Instagram photo media as JPG/PNG/WebP when available.
+
+For Instagram carousel posts, use `IG indexes` to pick which items to process:
+
+- `all`: process every matching item; in `IG photo` mode this skips video items
+- `1`: process only item 1
+- `1,3,5`: process items 1, 3, and 5
+- `2-8`: process items 2 through 8
+
+Use `List` next to `IG indexes` to ask `yt-dlp` how many carousel items it can see. For the sample carousel we tested, `yt-dlp` reported 20 total items, likely video indexes `2,11,19`, and likely photo indexes `1,3,4,5,6,7,8,9,10,12,13,14,15,16,17,18,20`. Instagram often requires browser cookies; choose the browser where you are already logged into Instagram.
 
 Required tools:
 
 ```bash
 yt-dlp --version
+gallery-dl --version
 ffmpeg -version
 ```
 
