@@ -53,7 +53,7 @@ final class MediaDownloaderDelegate: NSObject, NSApplicationDelegate {
         customWidthField.placeholderString = "e.g. 1280"
         customWidthField.stringValue = ""
 
-        formatPopup.addItems(withTitles: ["MP4 video", "MP3 audio", "Photo"])
+        formatPopup.addItems(withTitles: ["Youtube MP4", "Youtube MP3", "IG video", "IG photo"])
         downloadSizePopup.addItems(withTitles: ["Best", "1080p", "720p", "480p", "360p"])
         convertSizePopup.addItems(withTitles: ["No conversion", "1080p", "720p", "480p", "360p", "Custom width"])
         cookiesPopup.addItems(withTitles: ["No browser cookies", "Safari cookies", "Chrome cookies", "Firefox cookies"])
@@ -204,13 +204,21 @@ final class MediaDownloaderDelegate: NSObject, NSApplicationDelegate {
         ]
         args.append(contentsOf: cookieArgs())
 
-        if mode == "MP3 audio" {
+        switch mode {
+        case "Youtube MP3":
             args.append(contentsOf: ["-x", "--audio-format", "mp3", "--audio-quality", "0"])
-        } else if mode == "MP4 video" {
-            args.append(contentsOf: ["--merge-output-format", "mp4", "-f", videoFormat()])
-        } else {
+            log("Youtube MP3 mode selected. yt-dlp will extract audio and save MP3.")
+        case "Youtube MP4":
+            args.append(contentsOf: ["--merge-output-format", "mp4", "-f", youtubeVideoFormat()])
+            log("Youtube MP4 mode selected. yt-dlp will download video using the selected size.")
+        case "IG video":
+            args.append(contentsOf: ["--merge-output-format", "mp4", "-f", instagramVideoFormat()])
+            log("IG video mode selected. yt-dlp will download Instagram video/reel media as MP4 when available.")
+        case "IG photo":
             args.append(contentsOf: ["--skip-download", "--write-thumbnail", "--convert-thumbnails", "jpg"])
-            log("Photo mode selected. yt-dlp will save image thumbnails/photos as JPG when the URL provides photos.")
+            log("IG photo mode selected. yt-dlp will save Instagram photo media as JPG when available.")
+        default:
+            throw message("Choose a download mode first.")
         }
         args.append(sourceURL)
 
@@ -227,7 +235,7 @@ final class MediaDownloaderDelegate: NSObject, NSApplicationDelegate {
             log("Downloaded file: \(file.path)")
         }
 
-        if mode == "MP4 video", selected(convertSizePopup) != "No conversion" {
+        if ["Youtube MP4", "IG video"].contains(mode), selected(convertSizePopup) != "No conversion" {
             let converted = try convertMP4(finalFile)
             log("Converted file: \(converted.path)")
         }
@@ -278,7 +286,7 @@ final class MediaDownloaderDelegate: NSObject, NSApplicationDelegate {
         return output
     }
 
-    func videoFormat() -> String {
+    func youtubeVideoFormat() -> String {
         switch selected(downloadSizePopup) {
         case "1080p":
             return "bv*[height<=1080][ext=mp4]+ba[ext=m4a]/b[height<=1080][ext=mp4]/best[height<=1080]/best"
@@ -290,6 +298,21 @@ final class MediaDownloaderDelegate: NSObject, NSApplicationDelegate {
             return "bv*[height<=360][ext=mp4]+ba[ext=m4a]/b[height<=360][ext=mp4]/best[height<=360]/best"
         default:
             return "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/best"
+        }
+    }
+
+    func instagramVideoFormat() -> String {
+        switch selected(downloadSizePopup) {
+        case "1080p":
+            return "best[height<=1080][ext=mp4]/best[height<=1080]/best[ext=mp4]/best"
+        case "720p":
+            return "best[height<=720][ext=mp4]/best[height<=720]/best[ext=mp4]/best"
+        case "480p":
+            return "best[height<=480][ext=mp4]/best[height<=480]/best[ext=mp4]/best"
+        case "360p":
+            return "best[height<=360][ext=mp4]/best[height<=360]/best[ext=mp4]/best"
+        default:
+            return "best[ext=mp4]/best"
         }
     }
 
@@ -340,9 +363,9 @@ final class MediaDownloaderDelegate: NSObject, NSApplicationDelegate {
     func recentFiles(in directory: URL, since date: Date, mode: String) -> [URL] {
         let allowedExtensions: Set<String>
         switch mode {
-        case "Photo":
+        case "IG photo":
             allowedExtensions = ["jpg", "jpeg", "png", "webp", "heic", "avif"]
-        case "MP3 audio":
+        case "Youtube MP3":
             allowedExtensions = ["mp3", "m4a", "opus", "wav"]
         default:
             allowedExtensions = ["mp4", "m4v", "mov", "webm", "mkv"]

@@ -16,12 +16,17 @@ open /Users/tonyhuang/Documents/Codex/2026-05-02/video-work/MediaDownloader.app
 Features:
 
 - Paste a YouTube or Instagram URL
-- Download as `MP4 video`, `MP3 audio`, or `Photo`
+- Download as `Youtube MP4`, `Youtube MP3`, `IG video`, or `IG photo`
 - Choose download size: `Best`, `1080p`, `720p`, `480p`, `360p`
 - Optionally convert downloaded MP4 to `1080p`, `720p`, `480p`, `360p`, or a custom width
 - Optional browser cookies: Safari, Chrome, Firefox
 
-`Photo` mode is useful for Instagram photo posts. If the URL points to a video or reel, `yt-dlp` may still download video media because the platform provides video for that URL.
+Download modes:
+
+- `Youtube MP4`: downloads YouTube video as MP4 using the selected size.
+- `Youtube MP3`: extracts YouTube audio and saves MP3.
+- `IG video`: downloads Instagram video/reel media as MP4 when available.
+- `IG photo`: skips video download and saves Instagram photo media as JPG when available.
 
 Required tools:
 
