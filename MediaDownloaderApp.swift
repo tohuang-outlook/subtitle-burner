@@ -62,6 +62,7 @@ final class MediaDownloaderDelegate: NSObject, NSApplicationDelegate {
         downloadSizePopup.addItems(withTitles: ["Best", "1080p", "720p", "480p", "360p"])
         convertSizePopup.addItems(withTitles: ["No conversion", "1080p", "720p", "480p", "360p", "Custom width"])
         cookiesPopup.addItems(withTitles: ["No browser cookies", "Safari cookies", "Chrome cookies", "Firefox cookies"])
+        cookiesPopup.selectItem(withTitle: "Chrome cookies")
 
         root.addArrangedSubview(row("URL", urlField, "Paste", #selector(pasteURL)))
         root.addArrangedSubview(row("Output folder", outputField, "Choose", #selector(chooseOutput)))
@@ -211,6 +212,9 @@ final class MediaDownloaderDelegate: NSObject, NSApplicationDelegate {
         guard !sourceURL.isEmpty else { throw message("Paste a YouTube or Instagram URL first.") }
 
         let mode = selected(formatPopup)
+        if mode.hasPrefix("IG ") {
+            try requireInstagramCookies()
+        }
         if mode == "IG photo" {
             try performIGPhotoDownload(sourceURL: sourceURL, outputDir: outputDir)
             return
@@ -263,9 +267,6 @@ final class MediaDownloaderDelegate: NSObject, NSApplicationDelegate {
 
     func performIGPhotoDownload(sourceURL: String, outputDir: URL) throws {
         let galleryDL = try requireTool(text(galleryDLField), "gallery-dl")
-        if cookieArgs().isEmpty {
-            log("IG photo mode selected without browser cookies. If IG says login required, choose cookies from a browser where you are logged in.")
-        }
         let ranges = igGalleryRanges()
         let rangeText = ranges.compactMap { $0 }.joined(separator: ",")
         log("IG photo mode selected. gallery-dl will download Instagram photo media\(rangeText.isEmpty ? "" : " for index range \(rangeText)").")
@@ -433,12 +434,15 @@ final class MediaDownloaderDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    func requireInstagramCookies() throws {
+        guard !cookieArgs().isEmpty else {
+            throw message("Instagram downloads require browser cookies for this URL. Choose Chrome/Safari/Firefox cookies from a browser where you are already logged into Instagram, then try again.")
+        }
+    }
+
     func igPlaylistArgs(for mode: String) -> [String] {
         guard mode == "IG video" else {
             return []
-        }
-        if cookieArgs().isEmpty {
-            log("Instagram mode selected without browser cookies. If IG says login required, choose cookies from a browser where you are logged in.")
         }
         let raw = text(igIndexesField).trimmingCharacters(in: .whitespacesAndNewlines)
         guard !raw.isEmpty, raw.lowercased() != "all" else {
