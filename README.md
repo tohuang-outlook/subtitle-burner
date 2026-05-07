@@ -3,7 +3,7 @@
 This repo contains two small native macOS tools:
 
 - `SubtitleBurner.app`: generate bilingual subtitles and burn them into video.
-- `MediaDownloader.app`: download YouTube/Instagram media with `yt-dlp` and `gallery-dl`, save MP4/MP3/JPG, and optionally resize MP4 output.
+- `MediaDownloader.app`: download YouTube media with `yt-dlp`, download Instagram media with `gallery-dl`, save MP4/MP3/JPG, and optionally resize MP4 output.
 
 ## Media Downloader
 
@@ -25,7 +25,7 @@ Download modes:
 
 - `Youtube MP4`: downloads YouTube video as MP4 using the selected size.
 - `Youtube MP3`: extracts YouTube audio and saves MP3.
-- `IG video`: downloads Instagram video/reel media as MP4 when available.
+- `IG video`: uses `gallery-dl` to download Instagram video/reel media as MP4 when available.
 - `IG photo`: uses `gallery-dl` to save Instagram photo media as JPG/PNG/WebP when available.
 
 For Instagram carousel posts, use `IG indexes` to pick which items to process:

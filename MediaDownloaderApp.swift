@@ -205,7 +205,6 @@ final class MediaDownloaderDelegate: NSObject, NSApplicationDelegate {
     }
 
     func performDownload() throws {
-        let ytdlp = try requireTool(text(ytdlpField), "yt-dlp")
         let outputDir = URL(fileURLWithPath: text(outputField).isEmpty ? "\(NSHomeDirectory())/Downloads" : text(outputField))
         try FileManager.default.createDirectory(at: outputDir, withIntermediateDirectories: true)
         let sourceURL = text(urlField).trimmingCharacters(in: .whitespacesAndNewlines)
@@ -215,11 +214,18 @@ final class MediaDownloaderDelegate: NSObject, NSApplicationDelegate {
         if mode.hasPrefix("IG ") {
             try requireInstagramCookies()
         }
-        if mode == "IG photo" {
-            try performIGPhotoDownload(sourceURL: sourceURL, outputDir: outputDir)
+        if ["IG video", "IG photo"].contains(mode) {
+            let downloadedFiles = try performIGDownload(sourceURL: sourceURL, outputDir: outputDir, mode: mode)
+            if mode == "IG video", selected(convertSizePopup) != "No conversion" {
+                for file in downloadedFiles {
+                    let converted = try convertMP4(file)
+                    log("Converted file: \(converted.path)")
+                }
+            }
             return
         }
 
+        let ytdlp = try requireTool(text(ytdlpField), "yt-dlp")
         var args = [
             ytdlp,
             "--newline",
@@ -229,7 +235,6 @@ final class MediaDownloaderDelegate: NSObject, NSApplicationDelegate {
             "--print", "after_move:filepath"
         ]
         args.append(contentsOf: cookieArgs())
-        args.append(contentsOf: igPlaylistArgs(for: mode))
 
         switch mode {
         case "Youtube MP3":
@@ -238,9 +243,6 @@ final class MediaDownloaderDelegate: NSObject, NSApplicationDelegate {
         case "Youtube MP4":
             args.append(contentsOf: ["--merge-output-format", "mp4", "-f", youtubeVideoFormat()])
             log("Youtube MP4 mode selected. yt-dlp will download video using the selected size.")
-        case "IG video":
-            args.append(contentsOf: ["--ignore-errors", "--merge-output-format", "mp4", "-f", instagramVideoFormat()])
-            log("IG video mode selected. yt-dlp will download Instagram video/reel media as MP4 when available.")
         default:
             throw message("Choose a download mode first.")
         }
@@ -265,11 +267,13 @@ final class MediaDownloaderDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    func performIGPhotoDownload(sourceURL: String, outputDir: URL) throws {
+    func performIGDownload(sourceURL: String, outputDir: URL, mode: String) throws -> [URL] {
         let galleryDL = try requireTool(text(galleryDLField), "gallery-dl")
         let ranges = igGalleryRanges()
         let rangeText = ranges.compactMap { $0 }.joined(separator: ",")
-        log("IG photo mode selected. gallery-dl will download Instagram photo media\(rangeText.isEmpty ? "" : " for index range \(rangeText)").")
+        let filter = mode == "IG video" ? "video_url is not None" : "video_url is None"
+        let mediaName = mode == "IG video" ? "video" : "photo"
+        log("\(mode) mode selected. gallery-dl will download Instagram \(mediaName) media\(rangeText.isEmpty ? "" : " for index range \(rangeText)").")
 
         var downloadedFiles: [URL] = []
         var seen = Set<String>()
@@ -281,10 +285,9 @@ final class MediaDownloaderDelegate: NSObject, NSApplicationDelegate {
                 "--Print", "after:{_path}"
             ]
             args.append(contentsOf: cookieArgs())
+            args.append(contentsOf: ["--filter", filter])
             if let range {
                 args.append(contentsOf: ["--range", range])
-            } else {
-                args.append(contentsOf: ["--filter", "video_url is None"])
             }
             args.append(sourceURL)
 
@@ -292,7 +295,7 @@ final class MediaDownloaderDelegate: NSObject, NSApplicationDelegate {
             let result = try runCollecting(args)
             var files = findDownloadedFiles(in: result.lines)
             if files.isEmpty {
-                files = recentFiles(in: outputDir, since: startedAt, mode: "IG photo")
+                files = recentFiles(in: outputDir, since: startedAt, mode: mode)
             }
             for file in files where !seen.contains(file.path) {
                 seen.insert(file.path)
@@ -301,11 +304,12 @@ final class MediaDownloaderDelegate: NSObject, NSApplicationDelegate {
         }
 
         guard !downloadedFiles.isEmpty else {
-            throw message("IG photo download finished, but I could not identify a JPG/PNG output file. Check the log and output folder.")
+            throw message("\(mode) download finished, but I could not identify a matching output file. Check the IG indexes, log, and output folder.")
         }
         for file in downloadedFiles {
             log("Downloaded file: \(file.path)")
         }
+        return downloadedFiles
     }
 
     func performListIGIndexes() throws {
@@ -406,21 +410,6 @@ final class MediaDownloaderDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    func instagramVideoFormat() -> String {
-        switch selected(downloadSizePopup) {
-        case "1080p":
-            return "best[height<=1080][ext=mp4]/best[height<=1080]/best[ext=mp4]/best"
-        case "720p":
-            return "best[height<=720][ext=mp4]/best[height<=720]/best[ext=mp4]/best"
-        case "480p":
-            return "best[height<=480][ext=mp4]/best[height<=480]/best[ext=mp4]/best"
-        case "360p":
-            return "best[height<=360][ext=mp4]/best[height<=360]/best[ext=mp4]/best"
-        default:
-            return "best[ext=mp4]/best"
-        }
-    }
-
     func cookieArgs() -> [String] {
         switch selected(cookiesPopup) {
         case "Safari cookies":
@@ -438,17 +427,6 @@ final class MediaDownloaderDelegate: NSObject, NSApplicationDelegate {
         guard !cookieArgs().isEmpty else {
             throw message("Instagram downloads require browser cookies for this URL. Choose Chrome/Safari/Firefox cookies from a browser where you are already logged into Instagram, then try again.")
         }
-    }
-
-    func igPlaylistArgs(for mode: String) -> [String] {
-        guard mode == "IG video" else {
-            return []
-        }
-        let raw = text(igIndexesField).trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !raw.isEmpty, raw.lowercased() != "all" else {
-            return []
-        }
-        return ["--playlist-items", raw]
     }
 
     func igGalleryRanges() -> [String?] {
