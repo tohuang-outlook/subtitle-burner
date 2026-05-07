@@ -199,7 +199,7 @@ final class MediaDownloaderDelegate: NSObject, NSApplicationDelegate {
             "--newline",
             "--no-mtime",
             "-P", outputDir.path,
-            "-o", "%(title).200B.%(ext)s",
+            "-o", "%(title).180B [%(id)s].%(ext)s",
             "--print", "after_move:filepath"
         ]
         args.append(contentsOf: cookieArgs())
@@ -209,17 +209,23 @@ final class MediaDownloaderDelegate: NSObject, NSApplicationDelegate {
         } else if mode == "MP4 video" {
             args.append(contentsOf: ["--merge-output-format", "mp4", "-f", videoFormat()])
         } else {
-            args.append(contentsOf: ["--write-info-json"])
-            log("Photo mode selected. yt-dlp will download the original image media when the URL provides photos.")
+            args.append(contentsOf: ["--skip-download", "--write-thumbnail", "--convert-thumbnails", "jpg"])
+            log("Photo mode selected. yt-dlp will save image thumbnails/photos as JPG when the URL provides photos.")
         }
         args.append(sourceURL)
 
+        let startedAt = Date()
         let result = try runCollecting(args)
-        let finalFile = findDownloadedFile(in: result.lines)
-        guard let finalFile else {
+        var downloadedFiles = findDownloadedFiles(in: result.lines)
+        if downloadedFiles.isEmpty {
+            downloadedFiles = recentFiles(in: outputDir, since: startedAt, mode: mode)
+        }
+        guard let finalFile = downloadedFiles.last else {
             throw message("Download finished, but I could not identify the output file. Check the log and output folder.")
         }
-        log("Downloaded file: \(finalFile.path)")
+        for file in downloadedFiles {
+            log("Downloaded file: \(file.path)")
+        }
 
         if mode == "MP4 video", selected(convertSizePopup) != "No conversion" {
             let converted = try convertMP4(finalFile)
@@ -300,14 +306,66 @@ final class MediaDownloaderDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    func findDownloadedFile(in lines: [String]) -> URL? {
-        for line in lines.reversed() {
+    func findDownloadedFiles(in lines: [String]) -> [URL] {
+        var files: [URL] = []
+        var seen = Set<String>()
+        for line in lines {
             let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
-            if trimmed.hasPrefix("/"), FileManager.default.fileExists(atPath: trimmed) {
-                return URL(fileURLWithPath: trimmed)
+            let candidates = pathCandidates(from: trimmed)
+            for candidate in candidates where FileManager.default.fileExists(atPath: candidate) && !seen.contains(candidate) {
+                seen.insert(candidate)
+                files.append(URL(fileURLWithPath: candidate))
             }
         }
-        return nil
+        return files
+    }
+
+    func pathCandidates(from line: String) -> [String] {
+        var candidates: [String] = []
+        if line.hasPrefix("/") {
+            candidates.append(line)
+        }
+        for marker in [" to: ", " Destination: ", " Merging formats into "] {
+            if let range = line.range(of: marker) {
+                var path = String(line[range.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
+                path = path.trimmingCharacters(in: CharacterSet(charactersIn: "\"'"))
+                if path.hasPrefix("/") {
+                    candidates.append(path)
+                }
+            }
+        }
+        return candidates
+    }
+
+    func recentFiles(in directory: URL, since date: Date, mode: String) -> [URL] {
+        let allowedExtensions: Set<String>
+        switch mode {
+        case "Photo":
+            allowedExtensions = ["jpg", "jpeg", "png", "webp", "heic", "avif"]
+        case "MP3 audio":
+            allowedExtensions = ["mp3", "m4a", "opus", "wav"]
+        default:
+            allowedExtensions = ["mp4", "m4v", "mov", "webm", "mkv"]
+        }
+        guard let urls = try? FileManager.default.contentsOfDirectory(
+            at: directory,
+            includingPropertiesForKeys: [.contentModificationDateKey],
+            options: [.skipsHiddenFiles]
+        ) else {
+            return []
+        }
+        let threshold = date.addingTimeInterval(-5)
+        return urls.compactMap { url -> (URL, Date)? in
+            guard allowedExtensions.contains(url.pathExtension.lowercased()),
+                  let values = try? url.resourceValues(forKeys: [.contentModificationDateKey]),
+                  let modified = values.contentModificationDate,
+                  modified >= threshold else {
+                return nil
+            }
+            return (url, modified)
+        }
+        .sorted { $0.1 < $1.1 }
+        .map { $0.0 }
     }
 
     func start(_ work: @escaping () throws -> Void) {
