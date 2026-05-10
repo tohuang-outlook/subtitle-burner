@@ -81,9 +81,9 @@ final class AccentTile: NSButton {
         let iconColor  = isSelected ? NSColor.wsAccent : NSColor.wsSubtext
         let labelColor = isSelected ? NSColor.wsText   : NSColor.wsSubtext
 
-        let iAttr: [NSAttributedString.Key: Any] = [.font: NSFont.systemFont(ofSize: 18), .foregroundColor: iconColor]
+        let iAttr: [NSAttributedString.Key: Any] = [.font: NSFont.systemFont(ofSize: 20), .foregroundColor: iconColor]
         let lAttr: [NSAttributedString.Key: Any] = [
-            .font: NSFont.systemFont(ofSize: 10, weight: isSelected ? .semibold : .regular),
+            .font: NSFont.systemFont(ofSize: 20, weight: isSelected ? .semibold : .regular),
             .foregroundColor: labelColor
         ]
         let iStr = NSAttributedString(string: icon, attributes: iAttr)
@@ -115,7 +115,7 @@ final class PillToggle: NSButton {
         }
         let color = isSelected ? NSColor.white : NSColor.wsSubtext
         let attr: [NSAttributedString.Key: Any] = [
-            .font: NSFont.systemFont(ofSize: 11, weight: isSelected ? .semibold : .regular),
+            .font: NSFont.systemFont(ofSize: 15, weight: isSelected ? .semibold : .regular),
             .foregroundColor: color
         ]
         let s = NSAttributedString(string: title, attributes: attr)
@@ -123,7 +123,7 @@ final class PillToggle: NSButton {
         s.draw(at: NSPoint(x: (bounds.width - sz.width)/2, y: (bounds.height - sz.height)/2))
     }
     override var intrinsicContentSize: NSSize {
-        let w = (title as NSString).size(withAttributes: [.font: NSFont.systemFont(ofSize: 11)]).width
+        let w = (title as NSString).size(withAttributes: [.font: NSFont.systemFont(ofSize: 15)]).width
         return NSSize(width: w + 22, height: 26)
     }
 }
@@ -147,14 +147,79 @@ final class PrimaryButton: NSButton {
                                      xRadius: 0, yRadius: 0)
         NSColor(white: 1, alpha: 0.12).setFill(); highlight.fill()
 
-        let label = isRunning ? "⏳  Processing…" : "⬇   Start Download"
-        let attr: [NSAttributedString.Key: Any] = [
-            .font: NSFont.systemFont(ofSize: 13, weight: .semibold),
-            .foregroundColor: NSColor.white
-        ]
-        let s = NSAttributedString(string: label, attributes: attr)
-        let sz = s.size()
-        s.draw(at: NSPoint(x: (bounds.width - sz.width)/2, y: (bounds.height - sz.height)/2))
+        if isRunning {
+            // Spinner text
+            let attr: [NSAttributedString.Key: Any] = [
+                .font: NSFont.systemFont(ofSize: 15, weight: .semibold),
+                .foregroundColor: NSColor.white
+            ]
+            let s = NSAttributedString(string: "⏳  Processing…", attributes: attr)
+            let sz = s.size()
+            s.draw(at: NSPoint(x: (bounds.width - sz.width)/2, y: (bounds.height - sz.height)/2))
+        } else {
+            // Draw custom download icon + label using NSBezierPath (Y=0 at bottom in NSView)
+            let labelText = "Start Download"
+            let attr: [NSAttributedString.Key: Any] = [
+                .font: NSFont.systemFont(ofSize: 15, weight: .semibold),
+                .foregroundColor: NSColor.white
+            ]
+            let labelStr = NSAttributedString(string: labelText, attributes: attr)
+            let labelSz  = labelStr.size()
+            let iconW: CGFloat = 22
+            let iconH: CGFloat = 22
+            let gap:   CGFloat = 10
+            let totalW = iconW + gap + labelSz.width
+            let startX = (bounds.width - totalW) / 2
+            // In NSView: Y=0 is bottom, Y=bounds.height is top
+            let midY   = bounds.height / 2
+
+            // Draw label — vertically centered
+            labelStr.draw(at: NSPoint(x: startX + iconW + gap, y: midY - labelSz.height / 2))
+
+            // Icon bounding box: centered vertically
+            let ix  = startX
+            let iCX = ix + iconW / 2
+            let iBottom = midY - iconH / 2   // bottom of icon box
+            let iTop    = midY + iconH / 2   // top of icon box
+
+            NSColor.white.setStroke()
+            NSColor.white.setFill()
+
+            // 1. Arrow shaft: from near top down to ~40% from bottom
+            let shaftTop    = iTop - 2
+            let shaftBottom = iBottom + iconH * 0.38
+            let shaft = NSBezierPath()
+            shaft.lineWidth = 2
+            shaft.lineCapStyle = .round
+            shaft.move(to: NSPoint(x: iCX, y: shaftTop))
+            shaft.line(to: NSPoint(x: iCX, y: shaftBottom))
+            shaft.stroke()
+
+            // 2. Arrowhead: V pointing DOWN (in NSView coords, lower Y = lower on screen)
+            let arrowTip  = iBottom + iconH * 0.20   // tip points downward
+            let arrowWing = shaftBottom + 2
+            let arrow = NSBezierPath()
+            arrow.lineWidth = 2
+            arrow.lineCapStyle = .round
+            arrow.lineJoinStyle = .round
+            arrow.move(to: NSPoint(x: iCX - 6, y: arrowWing))
+            arrow.line(to: NSPoint(x: iCX,     y: arrowTip))
+            arrow.line(to: NSPoint(x: iCX + 6, y: arrowWing))
+            arrow.stroke()
+
+            // 3. Tray: U-shape at bottom — left cap | flat bottom | right cap
+            let trayY     = iBottom               // flat bottom of tray
+            let trayCapH: CGFloat = 5             // height of side caps
+            let tray = NSBezierPath()
+            tray.lineWidth = 2
+            tray.lineCapStyle = .round
+            tray.lineJoinStyle = .round
+            tray.move(to: NSPoint(x: ix,          y: trayY + trayCapH))   // left cap top
+            tray.line(to: NSPoint(x: ix,          y: trayY))              // left cap bottom
+            tray.line(to: NSPoint(x: ix + iconW,  y: trayY))              // bottom across
+            tray.line(to: NSPoint(x: ix + iconW,  y: trayY + trayCapH))   // right cap top
+            tray.stroke()
+        }
     }
 }
 
@@ -169,7 +234,7 @@ final class SecondaryButton: NSButton {
         layer?.borderWidth = 1
         layer?.borderColor = NSColor(red: 0.95, green: 0.35, blue: 0.35, alpha: 0.40).cgColor
         contentTintColor = NSColor.wsRed
-        font = .systemFont(ofSize: 11, weight: .medium)
+        font = .systemFont(ofSize: 15, weight: .medium)
     }
     required init?(coder: NSCoder) { nil }
 }
@@ -214,7 +279,7 @@ final class MediaDownloaderDelegate: NSObject, NSApplicationDelegate {
     var urlHistory:     [String] = []
     var selectedFormat  = 0
     var selectedDLSize  = 0
-    var selectedCVSize  = 0
+    var selectedCvSize  = 0
     var startTime:      Date?
     var elapsedTimer:   Timer?
 
@@ -231,7 +296,7 @@ final class MediaDownloaderDelegate: NSObject, NSApplicationDelegate {
 
     func buildUI() {
         window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 1020, height: 720),
+            contentRect: NSRect(x: 0, y: 0, width: 1100, height: 780),
             styleMask: [.titled, .closable, .miniaturizable, .resizable],
             backing: .buffered, defer: false
         )
@@ -240,7 +305,7 @@ final class MediaDownloaderDelegate: NSObject, NSApplicationDelegate {
         window.titlebarAppearsTransparent = true
         window.appearance = NSAppearance(named: .darkAqua)
         window.center()
-        window.minSize = NSSize(width: 860, height: 600)
+        window.minSize = NSSize(width: 920, height: 650)
 
         let root = NSView()
         root.translatesAutoresizingMaskIntoConstraints = false
@@ -258,18 +323,18 @@ final class MediaDownloaderDelegate: NSObject, NSApplicationDelegate {
         let appTitle = label("MediaDownloader", size: 14, weight: .bold, color: .wsText)
         let appSub   = label("macOS Edition", size: 10, color: .wsSubtext)
 
-        statusDot.font = .systemFont(ofSize: 9)
+        statusDot.font = .systemFont(ofSize: 15)
         statusDot.textColor = .wsGreen
-        statusLabel.font = .systemFont(ofSize: 11)
+        statusLabel.font = .systemFont(ofSize: 15)
         statusLabel.textColor = .wsSubtext
 
         let elapsedIcon = label("⏱", size: 10, color: .wsSubtext)
-        elapsedLabel.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
+        elapsedLabel.font = .monospacedSystemFont(ofSize: 15, weight: .regular)
         elapsedLabel.textColor = .wsSubtext
         elapsedLabel.stringValue = "00:00"
 
         let outputIcon = label("📁", size: 10, color: .wsSubtext)
-        outputFileLabel.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
+        outputFileLabel.font = .monospacedSystemFont(ofSize: 15, weight: .regular)
         outputFileLabel.textColor = .wsSubtext
         outputFileLabel.lineBreakMode = .byTruncatingMiddle
 
@@ -287,7 +352,7 @@ final class MediaDownloaderDelegate: NSObject, NSApplicationDelegate {
             titleBar.leadingAnchor.constraint(equalTo: root.leadingAnchor),
             titleBar.trailingAnchor.constraint(equalTo: root.trailingAnchor),
             titleBar.topAnchor.constraint(equalTo: root.topAnchor),
-            titleBar.heightAnchor.constraint(equalToConstant: 44),
+            titleBar.heightAnchor.constraint(equalToConstant: 52),
             leftTitle.leadingAnchor.constraint(equalTo: titleBar.leadingAnchor, constant: 80),
             leftTitle.centerYAnchor.constraint(equalTo: titleBar.centerYAnchor),
             rightStatus.trailingAnchor.constraint(equalTo: titleBar.trailingAnchor, constant: -16),
@@ -358,15 +423,15 @@ final class MediaDownloaderDelegate: NSObject, NSApplicationDelegate {
         urlCombo.hasVerticalScroller = true
         urlCombo.placeholderString = "YouTube or Instagram URL…"
         styleField(urlCombo)
-        urlCombo.heightAnchor.constraint(equalToConstant: 34).isActive = true
+        urlCombo.heightAnchor.constraint(equalToConstant: 40).isActive = true
         let pasteBtn = toolButton("Paste", #selector(pasteURL))
         let clearBtn = toolButton("✕", #selector(clearURL))
-        clearBtn.widthAnchor.constraint(equalToConstant: 28).isActive = true
+        clearBtn.widthAnchor.constraint(equalToConstant: 34).isActive = true
         stack.addArrangedSubview(fillRow([urlCombo, pasteBtn, clearBtn]))
 
         outputField.placeholderString = "Output folder…"
         styleField(outputField)
-        outputField.heightAnchor.constraint(equalToConstant: 34).isActive = true
+        outputField.heightAnchor.constraint(equalToConstant: 40).isActive = true
         let chooseBtn = toolButton("Browse", #selector(chooseOutput))
         stack.addArrangedSubview(fillRow([outputField, chooseBtn]))
 
@@ -413,7 +478,7 @@ final class MediaDownloaderDelegate: NSObject, NSApplicationDelegate {
         let cwGroup = vstack(spacing: 4, views: [microLabel("Custom Width"), customWidthField])
         customWidthField.placeholderString = "e.g. 1280"
         styleField(customWidthField)
-        customWidthField.heightAnchor.constraint(equalToConstant: 30).isActive = true
+        customWidthField.heightAnchor.constraint(equalToConstant: 42).isActive = true
         advGrid.addArrangedSubview(cwGroup)
 
         // IG indexes
@@ -422,7 +487,7 @@ final class MediaDownloaderDelegate: NSObject, NSApplicationDelegate {
         igIndexesField.placeholderString = "all, 1, 2-5"
         igIndexesField.stringValue = "all"
         styleField(igIndexesField)
-        igIndexesField.heightAnchor.constraint(equalToConstant: 30).isActive = true
+        igIndexesField.heightAnchor.constraint(equalToConstant: 42).isActive = true
         let igGroup = vstack(spacing: 4, views: [microLabel("IG Indexes"), igRow2])
         advGrid.addArrangedSubview(igGroup)
 
@@ -441,7 +506,7 @@ final class MediaDownloaderDelegate: NSObject, NSApplicationDelegate {
         let toolsToggle = NSButton(title: "", target: self, action: #selector(toggleTools))
         toolsToggle.isBordered = false
         let toolsHeader = NSStackView(); toolsHeader.orientation = .horizontal; toolsHeader.spacing = 6
-        toolsChevron.font = .systemFont(ofSize: 11); toolsChevron.textColor = .wsSubtext
+        toolsChevron.font = .systemFont(ofSize: 15); toolsChevron.textColor = .wsSubtext
         toolsHeader.addArrangedSubview(toolsChevron)
         toolsHeader.addArrangedSubview(sectionTitle("TOOL PATHS"))
         toolsHeader.addArrangedSubview(NSView())
@@ -457,46 +522,81 @@ final class MediaDownloaderDelegate: NSObject, NSApplicationDelegate {
         pin(toolsToggle, to: toolsClickRow)
         stack.addArrangedSubview(toolsClickRow)
 
-        toolsStack.orientation = .vertical; toolsStack.spacing = 8; toolsStack.isHidden = true
+        toolsStack.orientation = .vertical; toolsStack.spacing = 10; toolsStack.isHidden = true
+        toolsStack.alignment = .leading
         for (lbl, field, sel) in [
             ("yt-dlp", ytdlpField, #selector(chooseYTDLP)),
             ("gallery-dl", galleryDLField, #selector(chooseGalleryDL)),
             ("ffmpeg", ffmpegField, #selector(chooseFFmpeg))
         ] as [(String, NSTextField, Selector)] {
-            styleField(field); field.font = .monospacedSystemFont(ofSize: 10, weight: .regular)
-            field.heightAnchor.constraint(equalToConstant: 28).isActive = true
+            styleField(field)
+            field.font = .monospacedSystemFont(ofSize: 13, weight: .regular)
+            field.heightAnchor.constraint(equalToConstant: 40).isActive = true
             let findBtn = toolButton("Find", sel)
-            let r = NSStackView(); r.orientation = .horizontal; r.spacing = 6
-            r.addArrangedSubview(microLabel(lbl)); r.addArrangedSubview(NSView())
-            let col = vstack(spacing: 4, views: [microLabel(lbl), hstack(spacing: 6, views: [field, findBtn])])
+            // Use fillRow so field stretches like Source section does
+            let toolRow = fillRow([field, findBtn])
+            let lbl2 = microLabel(lbl)
+            let col = NSStackView()
+            col.orientation = .vertical
+            col.spacing = 4
+            col.alignment = .leading
+            col.addArrangedSubview(lbl2)
+            col.addArrangedSubview(toolRow)
+            // Bind col and toolRow width to toolsStack width
+            col.translatesAutoresizingMaskIntoConstraints = false
             toolsStack.addArrangedSubview(col)
         }
         let checkBtn = toolButton("Check Tools", #selector(checkTools))
         toolsStack.addArrangedSubview(checkBtn)
         stack.addArrangedSubview(toolsStack)
+        // After adding to stack, bind toolsStack width to stack width
+        toolsStack.translatesAutoresizingMaskIntoConstraints = false
 
         stack.addArrangedSubview(divider())
 
         // ── Download button ──────────────────────────────────────────
         downloadBtn.target = self; downloadBtn.action = #selector(download)
-        downloadBtn.heightAnchor.constraint(equalToConstant: 42).isActive = true
+        downloadBtn.heightAnchor.constraint(equalToConstant: 50).isActive = true
 
         cancelBtn = SecondaryButton(label: "✕  Cancel", action: #selector(cancelDownload), target: self)
         cancelBtn.isHidden = true
-        cancelBtn.heightAnchor.constraint(equalToConstant: 30).isActive = true
+        cancelBtn.heightAnchor.constraint(equalToConstant: 42).isActive = true
 
         progressBar.style = .bar; progressBar.isIndeterminate = true; progressBar.isHidden = true
+        // controlTint deprecated on macOS 14+
 
         let actionStack = NSStackView(); actionStack.orientation = .vertical; actionStack.spacing = 8
         actionStack.addArrangedSubview(downloadBtn)
         actionStack.addArrangedSubview(cancelBtn)
         actionStack.addArrangedSubview(progressBar)
         stack.addArrangedSubview(actionStack)
+        // Force actionStack and downloadBtn to fill full width
+        actionStack.translatesAutoresizingMaskIntoConstraints = false
+        actionStack.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -32).isActive = true
+        downloadBtn.translatesAutoresizingMaskIntoConstraints = false
+        downloadBtn.widthAnchor.constraint(equalTo: actionStack.widthAnchor).isActive = true
+        cancelBtn.translatesAutoresizingMaskIntoConstraints = false
+        cancelBtn.widthAnchor.constraint(equalTo: actionStack.widthAnchor).isActive = true
+        progressBar.translatesAutoresizingMaskIntoConstraints = false
+        progressBar.widthAnchor.constraint(equalTo: actionStack.widthAnchor).isActive = true
 
-        // Make stack fill width
+        // Make stack fill width — including toolsStack and its children
         for view in stack.arrangedSubviews {
             view.translatesAutoresizingMaskIntoConstraints = false
             view.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -32).isActive = true
+        }
+        // Bind toolsStack children (tool rows) to same width
+        for col in toolsStack.arrangedSubviews {
+            col.translatesAutoresizingMaskIntoConstraints = false
+            col.widthAnchor.constraint(equalTo: toolsStack.widthAnchor).isActive = true
+            if let colStack = col as? NSStackView {
+                for sub in colStack.arrangedSubviews {
+                    if let rowStack = sub as? NSStackView {
+                        rowStack.translatesAutoresizingMaskIntoConstraints = false
+                        rowStack.widthAnchor.constraint(equalTo: colStack.widthAnchor).isActive = true
+                    }
+                }
+            }
         }
 
         let scrollView = NSScrollView()
@@ -538,7 +638,7 @@ final class MediaDownloaderDelegate: NSObject, NSApplicationDelegate {
             headerInner.leadingAnchor.constraint(equalTo: header.leadingAnchor, constant: 12),
             headerInner.trailingAnchor.constraint(equalTo: header.trailingAnchor, constant: -12),
             headerInner.centerYAnchor.constraint(equalTo: header.centerYAnchor),
-            header.heightAnchor.constraint(equalToConstant: 36)
+            header.heightAnchor.constraint(equalToConstant: 42)
         ])
 
         // Divider under header
@@ -548,7 +648,7 @@ final class MediaDownloaderDelegate: NSObject, NSApplicationDelegate {
         logView.isEditable = false
         logView.drawsBackground = false
         logView.backgroundColor = .clear
-        logView.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
+        logView.font = .monospacedSystemFont(ofSize: 15, weight: .regular)
         logView.textColor = NSColor(red: 0.2, green: 0.85, blue: 0.45, alpha: 1)
         logView.textContainerInset = NSSize(width: 10, height: 10)
 
@@ -587,13 +687,13 @@ final class MediaDownloaderDelegate: NSObject, NSApplicationDelegate {
 
     func sectionTitle(_ text: String) -> NSTextField {
         let f = NSTextField(labelWithString: text)
-        f.font = .systemFont(ofSize: 9, weight: .bold)
+        f.font = .systemFont(ofSize: 15, weight: .bold)
         f.textColor = .wsSubtext; return f
     }
 
     func microLabel(_ text: String) -> NSTextField {
         let f = NSTextField(labelWithString: text)
-        f.font = .systemFont(ofSize: 10); f.textColor = .wsSubtext; return f
+        f.font = .systemFont(ofSize: 13); f.textColor = .wsSubtext; return f
     }
 
     func divider() -> NSBox {
@@ -609,9 +709,9 @@ final class MediaDownloaderDelegate: NSObject, NSApplicationDelegate {
         b.layer?.borderWidth = 1
         b.layer?.borderColor = NSColor.wsFieldBorder.cgColor
         b.contentTintColor = .wsText
-        b.font = .systemFont(ofSize: 11, weight: .medium)
-        b.heightAnchor.constraint(equalToConstant: 28).isActive = true
-        let w = (title as NSString).size(withAttributes: [.font: NSFont.systemFont(ofSize: 11)]).width
+        b.font = .systemFont(ofSize: 15, weight: .medium)
+        b.heightAnchor.constraint(equalToConstant: 34).isActive = true
+        let w = (title as NSString).size(withAttributes: [.font: NSFont.systemFont(ofSize: 15)]).width
         b.widthAnchor.constraint(greaterThanOrEqualToConstant: w + 18).isActive = true
         return b
     }
@@ -625,18 +725,18 @@ final class MediaDownloaderDelegate: NSObject, NSApplicationDelegate {
         if let tf = f as? NSTextField {
             tf.textColor = .wsText; tf.isBordered = false; tf.drawsBackground = false
             tf.focusRingType = .none
-            tf.font = .systemFont(ofSize: 12)
+            tf.font = .systemFont(ofSize: 14)
             if let cell = tf.cell as? NSTextFieldCell {
                 cell.placeholderAttributedString = NSAttributedString(
                     string: tf.placeholderString ?? "",
                     attributes: [.foregroundColor: NSColor.wsSubtext,
-                                 .font: NSFont.systemFont(ofSize: 12)]
+                                 .font: NSFont.systemFont(ofSize: 14)]
                 )
             }
         }
         if let cb = f as? NSComboBox {
             cb.textColor = .wsText; cb.isBordered = false; cb.drawsBackground = false
-            cb.focusRingType = .none; cb.font = .systemFont(ofSize: 12)
+            cb.focusRingType = .none; cb.font = .systemFont(ofSize: 14)
         }
     }
 
@@ -674,7 +774,7 @@ final class MediaDownloaderDelegate: NSObject, NSApplicationDelegate {
     func selectDLSize(_ i: Int) { selectedDLSize = i; downloadPills.forEach { $0.isSelected = $0.tag == i } }
 
     @objc func cvSizeTapped(_ s: PillToggle) { selectCVSize(s.tag) }
-    func selectCVSize(_ i: Int) { selectedCVSize = i; convertPills.forEach { $0.isSelected = $0.tag == i } }
+    func selectCVSize(_ i: Int) { selectedCvSize = i; convertPills.forEach { $0.isSelected = $0.tag == i } }
 
     // MARK: - Actions
 
@@ -783,7 +883,7 @@ final class MediaDownloaderDelegate: NSObject, NSApplicationDelegate {
         d.set(ffmpegField.stringValue,    forKey: Prefs.ffmpegPath)
         d.set(formatDefs[selectedFormat].1, forKey: Prefs.format)
         d.set(sizeDefs[selectedDLSize],    forKey: Prefs.downloadSize)
-        d.set(convertDefs[selectedCVSize], forKey: Prefs.convertSize)
+        d.set(convertDefs[selectedCvSize], forKey: Prefs.convertSize)
         d.set(urlHistory, forKey: Prefs.urlHistory)
     }
 
@@ -807,7 +907,7 @@ final class MediaDownloaderDelegate: NSObject, NSApplicationDelegate {
         if mode.hasPrefix("IG") { try requireInstagramCookies() }
         if ["IG Video","IG Photo"].contains(mode) {
             let files = try performIGDownload(sourceURL: src, outputDir: outputDir, mode: mode)
-            if mode == "IG Video", convertDefs[selectedCVSize] != "No conversion" {
+            if mode == "IG Video", convertDefs[selectedCvSize] != "No conversion" {
                 for f in files { let c = try convertMP4(f); showOutput(c) }
             }
             return
@@ -828,7 +928,7 @@ final class MediaDownloaderDelegate: NSObject, NSApplicationDelegate {
         if files.isEmpty { files = recentFiles(in: outputDir, since: started, mode: mode) }
         guard let final = files.last else { throw message("Download finished but output not found.") }
         files.forEach { showOutput($0) }
-        if mode == "YT Video", convertDefs[selectedCVSize] != "No conversion" {
+        if mode == "YT Video", convertDefs[selectedCvSize] != "No conversion" {
             let c = try convertMP4(final); showOutput(c)
         }
     }
@@ -879,7 +979,7 @@ final class MediaDownloaderDelegate: NSObject, NSApplicationDelegate {
 
     func convertMP4(_ input: URL) throws -> URL {
         let ff  = try requireTool(ffmpegField.stringValue, "ffmpeg")
-        let cvs = convertDefs[selectedCVSize]
+        let cvs = convertDefs[selectedCvSize]
         let scale: String; let suffix: String
         switch cvs {
         case "1080p": scale = "scale=-2:1080"; suffix = "1080p"
@@ -1047,7 +1147,7 @@ final class MediaDownloaderDelegate: NSObject, NSApplicationDelegate {
                 color = NSColor(red: 0.70, green: 0.70, blue: 0.80, alpha: 1)
             }
             let attrs: [NSAttributedString.Key: Any] = [
-                .font: NSFont.monospacedSystemFont(ofSize: 11, weight: .regular),
+                .font: NSFont.monospacedSystemFont(ofSize: 15, weight: .regular),
                 .foregroundColor: color
             ]
             self.logView.textStorage?.append(NSAttributedString(string: value + "\n", attributes: attrs))
