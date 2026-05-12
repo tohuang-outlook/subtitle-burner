@@ -1,153 +1,247 @@
-# Subtitle Burner
+# subtitle-burner
 
-This repo contains two small native macOS tools:
-
-- `SubtitleBurner.app`: generate bilingual subtitles and burn them into video.
-- `MediaDownloader.app`: download YouTube media with `yt-dlp`, download Instagram media with `gallery-dl`, save MP4/MP3/JPG, and optionally resize MP4 output.
-
-## Media Downloader
-
-Open:
-
-```bash
-open /Users/tonyhuang/Documents/Codex/2026-05-02/video-work/MediaDownloader.app
-```
-
-Features:
-
-- Paste a YouTube or Instagram URL
-- Download as `Youtube MP4`, `Youtube MP3`, `IG video`, or `IG photo`
-- Choose download size: `Best`, `1080p`, `720p`, `480p`, `360p`
-- Optionally convert downloaded MP4 to `1080p`, `720p`, `480p`, `360p`, or a custom width
-- Optional browser cookies: Safari, Chrome, Firefox
-
-Download modes:
-
-- `Youtube MP4`: downloads YouTube video as MP4 using the selected size.
-- `Youtube MP3`: extracts YouTube audio and saves MP3.
-- `IG video`: uses `gallery-dl` to download Instagram video/reel media as MP4 when available.
-- `IG photo`: uses `gallery-dl` to save Instagram photo media as JPG/PNG/WebP when available.
-
-For Instagram carousel posts, use `IG indexes` to pick which items to process:
-
-- `all`: process every matching item; in `IG photo` mode this skips video items
-- `1`: process only item 1
-- `1,3,5`: process items 1, 3, and 5
-- `2-8`: process items 2 through 8
-
-Use `List` next to `IG indexes` to ask `yt-dlp` how many carousel items it can see. For the sample carousel we tested, `yt-dlp` reported 20 total items, likely video indexes `2,11,19`, and likely photo indexes `1,3,4,5,6,7,8,9,10,12,13,14,15,16,17,18,20`. Instagram often requires browser cookies; choose the browser where you are already logged into Instagram.
-
-Required tools:
-
-```bash
-yt-dlp --version
-gallery-dl --version
-ffmpeg -version
-```
-
-If Instagram or YouTube asks for login, choose the browser cookies option that matches the browser where you are already logged in.
-
-Build:
-
-```bash
-./build_media_downloader.sh
-```
-
-Use only for media you own, have permission to download, or that the platform allows you to save.
+A pair of native macOS apps for bilingual subtitle generation and media downloading.
 
 ---
 
-本資料夾裡的 `SubtitleBurner.app` 是一個原生 macOS 小工具，會依照你的流程處理影片：
+## Apps
 
-1. `.mov` / `.mp4` 轉成 H.264 + AAC `.mp4`
-2. 抽出 `16kHz 16-bit WAV`
-3. 用 Whisper 產生英文 `.srt`
-4. 用 OpenAI、DeepSeek、Kimi 2.5、或 Google Gemini 把英文 `.srt` 翻成繁體中文 `.srt`
-5. 合併中文與英文成 `.ass`
-6. 用 ffmpeg + libass + `/System/Library/Fonts/STHeiti Medium.ttc` 燒入字幕
+| App | Description |
+|-----|-------------|
+| **SubtitleBurner** | Transcribe, translate, and burn Chinese + English subtitles into any video |
+| **MediaDownloader** | Download YouTube and Instagram media via `yt-dlp` and `gallery-dl` |
 
-## 使用方式
+---
 
-雙擊：
+## SubtitleBurner
 
-```bash
-/Users/tonyhuang/Documents/Codex/2026-05-02/video-work/SubtitleBurner.app
+### Screenshot
+
+Dark purple two-column workspace UI. Settings panel on the left, live process log on the right.
+
+### How it works
+
+1. Converts source video to H.264 + AAC MP4
+2. Extracts a 16kHz mono WAV directly from the original source
+3. Runs **Whisper** with word-level timestamps (`--word_timestamps True`) to generate an accurate English `.srt`
+4. Post-processes the SRT — splits multi-sentence cues at punctuation boundaries for better readability
+5. Translates English → Traditional Chinese using your chosen AI provider
+6. Generates a bilingual `.ass` file with two independent subtitle styles (Chinese above, English below)
+7. Burns subtitles into the final video using **ffmpeg + libass**
+
+### Build
+
+```sh
+./build.sh
 ```
 
-或從 Terminal 執行：
+### Launch
 
-```bash
-open /Users/tonyhuang/Documents/Codex/2026-05-02/video-work/SubtitleBurner.app
+```sh
+open SubtitleBurner.app
 ```
 
-這個版本是 Swift/AppKit 原生 app，不依賴 Python Tkinter。
+### Requirements
 
-## 需要安裝的工具
+```sh
+brew install ffmpeg
+pip install openai-whisper
+```
 
-這個 app 會自動搜尋 `/opt/homebrew/bin` 和 `/usr/local/bin`。請先確認這些指令在你自己的 Terminal 可用：
-
-```bash
+Verify:
+```sh
 ffmpeg -version
-ffmpeg -filters | grep ass
+ffmpeg -filters | grep ass    # must show the ass filter
 whisper --help
-HandBrakeCLI --version
 ```
 
-如果 `ffmpeg` 沒有 `ass` filter，請用有 libass 的 Homebrew ffmpeg 版本。
+### Features
 
-## 新流程
+#### Dark workstation UI
+Two-column layout — settings on the left, timestamped color-coded process log on the right. Matches a professional tool aesthetic (VS Code + Final Cut Pro style).
 
-按 `English SRT` 後，app 會在輸出資料夾建立：
+#### Bilingual subtitles
+Chinese and English are rendered as two independent ASS subtitle tracks:
+- **Chinese** — `Heiti SC`, ~2.6% of video height, positioned above English
+- **English** — `Arial`, ~2.2% of video height, at the very bottom
+- Small visual gap between the two lines for readability
+- Horizontal margins scale with video width to prevent overflow on vertical (9:16) video
 
-```text
-原始檔名_subtitle_work/
+#### Subtitle size reference
+
+| Resolution | Chinese | English |
+|------------|---------|---------|
+| 1920×1080 (horizontal) | ~50px | ~42px |
+| 1080×1920 (vertical 9:16) | ~28px | ~24px |
+| 1280×720 | ~19px | ~16px |
+
+#### Sync offset
+A **Sync Offset (seconds)** field lets you manually shift subtitles earlier or later:
+- `-0.5` → shift subtitles 0.5s earlier
+- `+1.0` → shift subtitles 1.0s later
+- Default: `0.0`
+
+#### Translation providers
+
+| Provider | Default model |
+|----------|--------------|
+| OpenAI | `gpt-4.1-mini` |
+| DeepSeek | `deepseek-chat` |
+| Kimi 2.5 | `moonshot-v1-8k` |
+| Google Gemini | `gemini-2.5-flash` |
+
+#### API key storage
+API keys are stored securely in the macOS **Keychain** — not in plain text. Switching providers automatically loads the saved key for that provider.
+
+#### Batch processing
+Drop multiple video files onto the window or use **Add Files…** to queue them. Click **Run Batch** to process all files sequentially. Each file shows its status (Queued / Running / Done / Failed / Cancelled).
+
+#### Cancel
+Click **Cancel** at any time to stop the current job or batch. The active ffmpeg/Whisper process is terminated immediately.
+
+#### Settings persistence
+All tool paths, whisper model, translate provider/model, output folder, and sync offset are saved via `UserDefaults` and restored on next launch.
+
+### Workflow
+
+**Full automated pipeline:**
+1. Drop a video file onto the window (or use Add Files…)
+2. Enter your API key and click **Save**
+3. Set sync offset if needed (default 0.0)
+4. Click **Run All**
+
+**Step by step:**
+1. **English SRT** → transcribes audio with Whisper
+2. **Translate EN→ZH** → calls AI provider to generate Chinese SRT
+3. **Merge ASS+Burn** → combines into `.ass` and burns into video
+
+All output goes into `<output_folder>/<filename>_subtitle_work/`.
+
+---
+
+## MediaDownloader
+
+### Screenshot
+
+Dark workstation two-column UI. Settings and options on the left, terminal-style process log on the right.
+
+### Build
+
+```sh
+./build_media_downloader.sh
 ```
 
-裡面會有：
+### Launch
 
-```text
-原始檔名.en.srt
+```sh
+open MediaDownloader.app
 ```
 
-如果要自動翻譯，先在 `Translate mode` 選擇翻譯服務，再把對應 API key 貼到 `Translate API key` 欄位，按 `Translate EN to ZH`。它會產生：
+### Requirements
 
-```text
-原始檔名.zh.srt
+```sh
+brew install yt-dlp gallery-dl ffmpeg
 ```
 
-最後按 `Merge ASS + Burn`，產生：
+### Features
 
-```text
-原始檔名.zh_en.ass
-原始檔名_with_subtitles.mp4
+#### Download modes
+
+| Mode | Tool | Output |
+|------|------|--------|
+| YT Video | yt-dlp | `.mp4` |
+| YT Audio | yt-dlp | `.mp3` |
+| IG Video | gallery-dl | `.mp4` |
+| IG Photo | gallery-dl | `.jpg` / `.png` |
+
+#### Download size
+Choose from **Best**, **1080p**, **720p**, **480p**, **360p** using pill selectors.
+
+#### Convert MP4
+Optionally re-encode the downloaded MP4 to a target resolution or custom width after download.
+
+#### Instagram carousel
+Use the **IG Indexes** field to select specific carousel items:
+
+| Value | Behaviour |
+|-------|-----------|
+| `all` | Every matching item |
+| `1` | First item only |
+| `1,3,5` | Items 1, 3, 5 |
+| `2-8` | Items 2 through 8 |
+
+Click **List** to check how many items are in the carousel before downloading.
+
+#### Browser cookies
+Select **Safari**, **Chrome**, or **Firefox** to use your logged-in session for Instagram or age-restricted YouTube content.
+
+#### URL history
+The URL field remembers your last 20 URLs — click the dropdown to re-use a previous URL.
+
+#### Tool Paths (collapsible)
+Click **› TOOL PATHS** to expand and set custom paths for `yt-dlp`, `gallery-dl`, and `ffmpeg`. Paths are auto-detected from Homebrew on first launch.
+
+#### Settings persistence
+All settings (format, size, cookies, output folder, tool paths) are saved via `UserDefaults` and restored on next launch.
+
+---
+
+## Build a DMG installer
+
+To package MediaDownloader into a distributable `.dmg`:
+
+```sh
+chmod +x build_dmg.sh
+./build_dmg.sh
 ```
 
-`Run All` 會自動執行：英文 SRT、翻譯中文 SRT、合併 ASS、燒入影片。
+This produces `MediaDownloader.dmg`. When opened, drag the app to Applications.
 
-如果沒有 API key，也可以自己準備中文 SRT，放到 `Chinese .srt` 欄位後再按 `Merge ASS + Burn`。
+---
 
-## 翻譯模式
+## Project structure
 
-`OpenAI`
+```
+subtitle-burner/
+├── SubtitleBurnerApp.swift          # SubtitleBurner — all-in-one source
+├── MediaDownloaderApp.swift         # MediaDownloader — all-in-one source
+├── build.sh                         # Build SubtitleBurner.app
+├── build_media_downloader.sh        # Build MediaDownloader.app
+├── build_dmg.sh                     # Package MediaDownloader into DMG
+├── SubtitleBurnerIcon-1024.png      # App icon source
+├── MediaDownloaderIcon-1024.png     # App icon source
+└── README.md
+```
 
-- API: Responses API
-- Default model: `gpt-4.1-mini`
-- Key: OpenAI API key
+---
 
-`DeepSeek`
+## Troubleshooting
 
-- API: `https://api.deepseek.com/chat/completions`
-- Default model: `deepseek-v4-flash`
-- Key: DeepSeek API key
+**"Apple cannot check it for malicious software"**
+```sh
+xattr -cr SubtitleBurner.app
+xattr -cr MediaDownloader.app
+```
 
-`Kimi 2.5`
+**ffmpeg missing `ass` filter**
+```sh
+brew reinstall ffmpeg
+```
 
-- API: `https://api.moonshot.ai/v1/chat/completions`
-- Default model: `kimi-k2.5`
-- Key: Moonshot / Kimi API key
+**Whisper not found**
+```sh
+pip install openai-whisper
+which whisper   # copy this path into the app's whisper field
+```
 
-`Google Gemini`
+**Subtitles out of sync**
+Use the **Sync Offset** field in SubtitleBurner. Try `-0.5` or `-1.0` if subtitles are consistently late.
 
-- API: `https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent`
-- Default model: `gemini-2.5-flash`
-- Key: Gemini API key
+**Instagram download fails**
+Instagram requires browser cookies. Select Chrome/Safari/Firefox in the cookies dropdown (the browser where you are logged into Instagram).
+
+---
+
+## Legal
+
+MediaDownloader is intended for content you own, have permission to download, or that the platform explicitly allows you to save. Respect copyright and platform terms of service.
