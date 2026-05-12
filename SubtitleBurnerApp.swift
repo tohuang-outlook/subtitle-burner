@@ -1,307 +1,805 @@
-import AppKit
 import Foundation
 
-struct Paths {
-    let root: URL
-    let mp4: URL
-    let wav: URL
-    let zhSRT: URL
-    let enSRT: URL
-    let ass: URL
-    let burned: URL
+// MARK: - Models
+
+public struct Cue: Equatable {
+    public let index: Int
+    public let start: String
+    public let end: String
+    public let text: String
+
+    public init(index: Int, start: String, end: String, text: String) {
+        self.index = index
+        self.start = start
+        self.end = end
+        self.text = text
+    }
 }
 
-struct Cue {
-    let start: String
-    let end: String
-    let text: String
+// MARK: - SRTParser
+
+public enum SRTParserError: LocalizedError {
+    case emptyFile
+    case malformedBlock(String)
+
+    public var errorDescription: String? {
+        switch self {
+        case .emptyFile: return "SRT file is empty."
+        case .malformedBlock(let b): return "Malformed SRT block: \(b)"
+        }
+    }
 }
 
-final class AppDelegate: NSObject, NSApplicationDelegate {
-    var window: NSWindow!
-    let appBinDir: String
-    let sourceField = NSTextField()
-    let outputField = NSTextField()
-    let englishField = NSTextField()
-    let chineseField = NSTextField()
-    let ffmpegField = NSTextField()
-    let ffprobeField = NSTextField()
-    let whisperField = NSTextField()
-    let apiKeyField = NSSecureTextField()
-    let translateModelField = NSTextField()
-    let modelPopup = NSPopUpButton()
-    let providerPopup = NSPopUpButton()
-    let logView = NSTextView()
-    var running = false
+public struct SRTParser {
 
-    override init() {
-        let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
-            ?? URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent("Library/Application Support", isDirectory: true)
-        appBinDir = support.appendingPathComponent("SubtitleBurner/bin", isDirectory: true).path
-        super.init()
-        prepareAppBin()
+    public init() {}
+
+    /// Parse an SRT file URL into an ordered array of Cues.
+    public func parse(_ url: URL) throws -> [Cue] {
+        let raw = try String(contentsOf: url, encoding: .utf8)
+        return try parse(string: raw)
     }
 
-    func applicationDidFinishLaunching(_ notification: Notification) {
-        buildUI()
+    /// Parse raw SRT text into an ordered array of Cues.
+    public func parse(string raw: String) throws -> [Cue] {
+        let normalized = raw
+            .replacingOccurrences(of: "\r\n", with: "\n")
+            .replacingOccurrences(of: "\r", with: "\n")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+
+        guard !normalized.isEmpty else { return [] }
+
+        let blocks = normalized.components(separatedBy: "\n\n")
+        var cues: [Cue] = []
+
+        for block in blocks {
+            let lines = block
+                .components(separatedBy: "\n")
+                .filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+            guard lines.count >= 2 else { continue }
+
+            // Find timing line — may be line 0 (no index) or line 1 (index present)
+            let timingIndex = lines[0].contains("-->") ? 0 : 1
+            guard lines.indices.contains(timingIndex),
+                  lines[timingIndex].contains("-->") else { continue }
+
+            let timing = lines[timingIndex].components(separatedBy: "-->")
+            guard timing.count == 2 else { continue }
+
+            let start = timing[0].trimmingCharacters(in: .whitespaces)
+                .components(separatedBy: " ")[0]
+            let end = timing[1].trimmingCharacters(in: .whitespaces)
+                .components(separatedBy: " ")[0]
+            let text = lines.dropFirst(timingIndex + 1).joined(separator: "\n")
+            let index = Int(lines[0].trimmingCharacters(in: .whitespacesAndNewlines)) ?? (cues.count + 1)
+
+            cues.append(Cue(index: index, start: start, end: end, text: text))
+        }
+
+        return cues
+    }
+}
+
+// MARK: - Time conversion
+
+public struct ASSTime {
+
+    /// Convert SRT timestamp (00:01:23,456) → ASS timestamp (0:01:23.45)
+    public static func fromSRT(_ value: String) -> String {
+        let parts = value.replacingOccurrences(of: ",", with: ".").components(separatedBy: ".")
+        let hms = parts[0].split(separator: ":").map(String.init)
+        guard hms.count == 3 else { return "0:00:00.00" }
+        let centis = String((parts.count > 1 ? parts[1] : "00").prefix(2))
+        let h = Int(hms[0]) ?? 0
+        return "\(h):\(hms[1]):\(hms[2]).\(centis)"
+    }
+}
+
+// MARK: - ASS escaping
+
+public struct ASSEscape {
+
+    public static func body(_ text: String) -> String {
+        text
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "{", with: "\\{")
+            .replacingOccurrences(of: "}", with: "\\}")
+            .replacingOccurrences(of: "\n", with: "\\N")
     }
 
-    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
-        true
+    /// Escape a file path for use inside an ffmpeg filter string.
+    public static func filterPath(_ text: String) -> String {
+        text
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: ":", with: "\\:")
+            .replacingOccurrences(of: "'", with: "\\'")
+            .replacingOccurrences(of: ",", with: "\\,")
+    }
+}
+import Security
+
+/// Stores and retrieves per-provider API keys from the macOS Keychain.
+/// Keys are scoped to the app's bundle identifier so they survive app restarts.
+public struct KeychainStore {
+
+    private static let service = Bundle.main.bundleIdentifier ?? "com.subtitle-burner"
+
+    // MARK: - Public API
+
+    public static func save(key: String, for provider: String) {
+        let account = accountName(for: provider)
+        let data = Data(key.utf8)
+
+        // Try update first
+        let updateQuery: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: account
+        ]
+        let attributes: [String: Any] = [kSecValueData as String: data]
+        let updateStatus = SecItemUpdate(updateQuery as CFDictionary, attributes as CFDictionary)
+
+        if updateStatus == errSecItemNotFound {
+            // Item doesn't exist yet — add it
+            let addQuery: [String: Any] = [
+                kSecClass as String: kSecClassGenericPassword,
+                kSecAttrService as String: service,
+                kSecAttrAccount as String: account,
+                kSecValueData as String: data,
+                kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlock
+            ]
+            SecItemAdd(addQuery as CFDictionary, nil)
+        }
     }
 
-    func buildUI() {
-        window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 920, height: 680),
-            styleMask: [.titled, .closable, .miniaturizable, .resizable],
-            backing: .buffered,
-            defer: false
-        )
-        window.title = "Subtitle Burner"
-        window.center()
-
-        let root = NSStackView()
-        root.orientation = .vertical
-        root.spacing = 10
-        root.edgeInsets = NSEdgeInsets(top: 16, left: 16, bottom: 16, right: 16)
-        root.translatesAutoresizingMaskIntoConstraints = false
-        window.contentView?.addSubview(root)
-        NSLayoutConstraint.activate([
-            root.leadingAnchor.constraint(equalTo: window.contentView!.leadingAnchor),
-            root.trailingAnchor.constraint(equalTo: window.contentView!.trailingAnchor),
-            root.topAnchor.constraint(equalTo: window.contentView!.topAnchor),
-            root.bottomAnchor.constraint(equalTo: window.contentView!.bottomAnchor)
-        ])
-
-        sourceField.stringValue = ""
-        outputField.stringValue = "\(NSHomeDirectory())/Downloads"
-        englishField.stringValue = ""
-        chineseField.stringValue = ""
-        ffmpegField.stringValue = findTool("ffmpeg")
-        ffprobeField.stringValue = findTool("ffprobe")
-        whisperField.stringValue = findTool("whisper")
-        apiKeyField.stringValue = ProcessInfo.processInfo.environment["OPENAI_API_KEY"] ?? ""
-        translateModelField.stringValue = "gpt-4.1-mini"
-
-        root.addArrangedSubview(row("Source .mov/.mp4", sourceField, "Choose", #selector(chooseSource)))
-        root.addArrangedSubview(row("Output folder", outputField, "Choose", #selector(chooseOutput)))
-        root.addArrangedSubview(row("English .srt", englishField, "Choose", #selector(chooseEnglishSRT)))
-        root.addArrangedSubview(row("Chinese .srt", chineseField, "Choose", #selector(chooseChineseSRT)))
-        root.addArrangedSubview(separator())
-        root.addArrangedSubview(row("ffmpeg", ffmpegField, "Find", #selector(chooseFFmpeg)))
-        root.addArrangedSubview(row("ffprobe", ffprobeField, "Find", #selector(chooseFFprobe)))
-        root.addArrangedSubview(row("whisper", whisperField, "Find", #selector(chooseWhisper)))
-        root.addArrangedSubview(providerRow())
-        root.addArrangedSubview(row("Translate API key", apiKeyField, "Paste", #selector(pasteAPIKey)))
-        root.addArrangedSubview(row("Translate model", translateModelField, "Default", #selector(defaultTranslateModel)))
-
-        let modelRow = NSStackView()
-        modelRow.orientation = .horizontal
-        modelRow.spacing = 8
-        let modelLabel = label("Whisper model")
-        modelPopup.addItems(withTitles: ["turbo", "small", "medium", "large-v3"])
-        modelRow.addArrangedSubview(modelLabel)
-        modelRow.addArrangedSubview(modelPopup)
-        modelRow.addArrangedSubview(NSView())
-        modelLabel.widthAnchor.constraint(equalToConstant: 130).isActive = true
-        root.addArrangedSubview(modelRow)
-
-        let buttons = NSStackView()
-        buttons.orientation = .horizontal
-        buttons.spacing = 10
-        buttons.addArrangedSubview(button("Check Dependencies", #selector(checkDependencies)))
-        buttons.addArrangedSubview(button("English SRT", #selector(runEnglishSRT)))
-        buttons.addArrangedSubview(button("Translate EN to ZH", #selector(translateENToZH)))
-        buttons.addArrangedSubview(button("Merge ASS + Burn", #selector(mergeAndBurn)))
-        buttons.addArrangedSubview(button("Run All", #selector(runAll)))
-        buttons.addArrangedSubview(NSView())
-        root.addArrangedSubview(buttons)
-
-        let note = NSTextField(labelWithString: "Flow: generate English SRT, translate it to Chinese SRT with OpenAI, DeepSeek, or Kimi 2.5, then burn Chinese top + English bottom.")
-        note.font = .systemFont(ofSize: 12)
-        root.addArrangedSubview(note)
-
-        logView.isEditable = false
-        logView.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
-        let scroll = NSScrollView()
-        scroll.hasVerticalScroller = true
-        scroll.documentView = logView
-        root.addArrangedSubview(scroll)
-        scroll.heightAnchor.constraint(greaterThanOrEqualToConstant: 320).isActive = true
-
-        window.makeKeyAndOrderFront(nil)
-        NSApp.activate(ignoringOtherApps: true)
+    public static func load(for provider: String) -> String? {
+        let account = accountName(for: provider)
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: account,
+            kSecReturnData as String: true,
+            kSecMatchLimit as String: kSecMatchLimitOne
+        ]
+        var result: AnyObject?
+        let status = SecItemCopyMatching(query as CFDictionary, &result)
+        guard status == errSecSuccess,
+              let data = result as? Data,
+              let string = String(data: data, encoding: .utf8),
+              !string.isEmpty else { return nil }
+        return string
     }
 
-    func row(_ title: String, _ field: NSTextField, _ buttonTitle: String, _ action: Selector) -> NSStackView {
-        let stack = NSStackView()
-        stack.orientation = .horizontal
-        stack.spacing = 8
-        let titleLabel = label(title)
-        stack.addArrangedSubview(titleLabel)
-        stack.addArrangedSubview(field)
-        stack.addArrangedSubview(button(buttonTitle, action))
-        titleLabel.widthAnchor.constraint(equalToConstant: 130).isActive = true
-        field.heightAnchor.constraint(equalToConstant: 26).isActive = true
-        return stack
+    public static func delete(for provider: String) {
+        let account = accountName(for: provider)
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: account
+        ]
+        SecItemDelete(query as CFDictionary)
     }
 
-    func providerRow() -> NSStackView {
-        let stack = NSStackView()
-        stack.orientation = .horizontal
-        stack.spacing = 8
-        let titleLabel = label("Translate mode")
-        providerPopup.addItems(withTitles: ["OpenAI", "DeepSeek", "Kimi 2.5", "Google Gemini"])
-        providerPopup.target = self
-        providerPopup.action = #selector(providerChanged)
-        stack.addArrangedSubview(titleLabel)
-        stack.addArrangedSubview(providerPopup)
-        stack.addArrangedSubview(NSView())
-        titleLabel.widthAnchor.constraint(equalToConstant: 130).isActive = true
-        return stack
+    // MARK: - Private
+
+    private static func accountName(for provider: String) -> String {
+        "api-key-\(provider.lowercased().replacingOccurrences(of: " ", with: "-"))"
+    }
+}
+
+/// Persists all user-configurable app settings via UserDefaults.
+/// Call `save()` whenever a field changes; call the static properties on launch to restore.
+public struct Settings {
+
+    private static let defaults = UserDefaults.standard
+
+    // MARK: - Keys
+
+    private enum Key: String {
+        case outputFolder
+        case ffmpegPath
+        case ffprobePath
+        case whisperPath
+        case whisperModel
+        case translateProvider
+        case translateModel
+        case fontPath
+        case lastSourceFolder
     }
 
-    func label(_ value: String) -> NSTextField {
-        let field = NSTextField(labelWithString: value)
-        field.alignment = .right
-        return field
+    // MARK: - Properties
+
+    public static var outputFolder: String {
+        get { defaults.string(forKey: Key.outputFolder.rawValue) ?? "\(NSHomeDirectory())/Downloads" }
+        set { defaults.set(newValue, forKey: Key.outputFolder.rawValue) }
     }
 
-    func button(_ title: String, _ action: Selector) -> NSButton {
-        let button = NSButton(title: title, target: self, action: action)
-        button.bezelStyle = .rounded
-        return button
+    public static var ffmpegPath: String {
+        get { defaults.string(forKey: Key.ffmpegPath.rawValue) ?? "" }
+        set { defaults.set(newValue, forKey: Key.ffmpegPath.rawValue) }
     }
 
-    func separator() -> NSBox {
-        let box = NSBox()
-        box.boxType = .separator
-        return box
+    public static var ffprobePath: String {
+        get { defaults.string(forKey: Key.ffprobePath.rawValue) ?? "" }
+        set { defaults.set(newValue, forKey: Key.ffprobePath.rawValue) }
     }
 
-    @objc func chooseSource() {
-        let panel = NSOpenPanel()
-        panel.allowedFileTypes = ["mov", "mp4", "m4v"]
-        panel.allowsMultipleSelection = false
-        if panel.runModal() == .OK, let url = panel.url {
-            sourceField.stringValue = url.path
-            if outputField.stringValue.isEmpty {
-                outputField.stringValue = url.deletingLastPathComponent().path
+    public static var whisperPath: String {
+        get { defaults.string(forKey: Key.whisperPath.rawValue) ?? "" }
+        set { defaults.set(newValue, forKey: Key.whisperPath.rawValue) }
+    }
+
+    public static var whisperModel: String {
+        get { defaults.string(forKey: Key.whisperModel.rawValue) ?? "turbo" }
+        set { defaults.set(newValue, forKey: Key.whisperModel.rawValue) }
+    }
+
+    public static var translateProvider: String {
+        get { defaults.string(forKey: Key.translateProvider.rawValue) ?? "OpenAI" }
+        set { defaults.set(newValue, forKey: Key.translateProvider.rawValue) }
+    }
+
+    public static var translateModel: String {
+        get { defaults.string(forKey: Key.translateModel.rawValue) ?? "gpt-4.1-mini" }
+        set { defaults.set(newValue, forKey: Key.translateModel.rawValue) }
+    }
+
+    /// Path to the CJK font used for subtitle burn-in.
+    /// Falls back to the bundled Noto font path if the system STHeiti is absent.
+    public static var fontPath: String {
+        get {
+            if let saved = defaults.string(forKey: Key.fontPath.rawValue), !saved.isEmpty {
+                return saved
             }
+            return preferredSystemFont()
+        }
+        set { defaults.set(newValue, forKey: Key.fontPath.rawValue) }
+    }
+
+    public static var lastSourceFolder: String {
+        get { defaults.string(forKey: Key.lastSourceFolder.rawValue) ?? NSHomeDirectory() }
+        set { defaults.set(newValue, forKey: Key.lastSourceFolder.rawValue) }
+    }
+
+    // MARK: - Font resolution
+
+    /// Returns the best available CJK font path, preferring the system font,
+    /// then a bundled fallback, then an empty string (caller should warn the user).
+    public static func preferredSystemFont() -> String {
+        let candidates = [
+            "/System/Library/Fonts/STHeiti Medium.ttc",
+            "/System/Library/Fonts/Hiragino Sans GB.ttc",
+            "/Library/Fonts/Arial Unicode MS.ttf",
+            // Bundled fallback — place NotoSansCJKtc-Regular.otf in the app bundle
+            Bundle.main.path(forResource: "NotoSansCJKtc-Regular", ofType: "otf") ?? ""
+        ]
+        return candidates.first { !$0.isEmpty && FileManager.default.fileExists(atPath: $0) } ?? ""
+    }
+
+    /// Default model name for a given provider.
+    public static func defaultModel(for provider: String) -> String {
+        switch provider {
+        case "DeepSeek":    return "deepseek-chat"
+        case "Kimi 2.5":   return "moonshot-v1-8k"
+        case "Google Gemini": return "gemini-2.5-flash"
+        default:            return "gpt-4.1-mini"
+        }
+    }
+}
+
+// MARK: - Protocol
+
+public protocol TranslationService {
+    var providerName: String { get }
+    func translate(cues: [Cue], model: String, apiKey: String) async throws -> [Cue]
+}
+
+// MARK: - Shared helpers
+
+struct TranslationHelpers {
+
+    static let maxChunkSize = 24
+
+    /// Splits cues into chunks, translates each, retries on failure with halved chunk size.
+    static func translateAll(
+        cues: [Cue],
+        model: String,
+        apiKey: String,
+        log: @escaping (String) -> Void,
+        callAPI: @escaping ([Cue]) async throws -> [Int: String]
+    ) async throws -> [Cue] {
+        var translated = Array(repeating: "", count: cues.count)
+        try await translateRange(cues, start: 0, end: cues.count,
+                                 maxChunkSize: maxChunkSize, translated: &translated,
+                                 log: log, callAPI: callAPI)
+        return cues.enumerated().map { i, cue in
+            Cue(index: cue.index, start: cue.start, end: cue.end, text: translated[i])
         }
     }
 
-    @objc func chooseOutput() {
-        let panel = NSOpenPanel()
-        panel.canChooseDirectories = true
-        panel.canChooseFiles = false
-        if panel.runModal() == .OK, let url = panel.url {
-            outputField.stringValue = url.path
-        }
-    }
-
-    @objc func chooseEnglishSRT() { chooseFile(into: englishField, types: ["srt"]) }
-    @objc func chooseChineseSRT() { chooseFile(into: chineseField, types: ["srt"]) }
-    @objc func chooseFFmpeg() { chooseFile(into: ffmpegField, types: nil) }
-    @objc func chooseFFprobe() { chooseFile(into: ffprobeField, types: nil) }
-    @objc func chooseWhisper() { chooseFile(into: whisperField, types: nil) }
-    @objc func pasteAPIKey() { apiKeyField.stringValue = NSPasteboard.general.string(forType: .string) ?? apiKeyField.stringValue }
-    @objc func defaultTranslateModel() { translateModelField.stringValue = defaultModel(for: selectedProvider()) }
-    @objc func providerChanged() {
-        translateModelField.stringValue = defaultModel(for: selectedProvider())
-        switch selectedProvider() {
-        case "OpenAI":
-            apiKeyField.stringValue = ProcessInfo.processInfo.environment["OPENAI_API_KEY"] ?? apiKeyField.stringValue
-        case "DeepSeek":
-            apiKeyField.stringValue = ProcessInfo.processInfo.environment["DEEPSEEK_API_KEY"] ?? ""
-        case "Kimi 2.5":
-            apiKeyField.stringValue = ProcessInfo.processInfo.environment["MOONSHOT_API_KEY"] ?? ""
-        case "Google Gemini":
-            apiKeyField.stringValue = ProcessInfo.processInfo.environment["GEMINI_API_KEY"] ?? ""
-        default:
-            break
-        }
-    }
-
-    func chooseFile(into field: NSTextField, types: [String]?) {
-        let panel = NSOpenPanel()
-        panel.allowedFileTypes = types
-        panel.allowsMultipleSelection = false
-        if panel.runModal() == .OK, let url = panel.url {
-            field.stringValue = url.path
-        }
-    }
-
-    @objc func checkDependencies() {
-        start {
-            self.log("Checking dependencies...")
-            for (name, path) in [
-                ("ffmpeg", self.text(self.ffmpegField)),
-                ("ffprobe", self.text(self.ffprobeField)),
-                ("whisper", self.text(self.whisperField)),
-                ("STHeiti Medium.ttc", "/System/Library/Fonts/STHeiti Medium.ttc")
-            ] {
-                self.log("\(name): \(FileManager.default.fileExists(atPath: path) ? "OK" : "Missing") \(path)")
-            }
-            let ffmpeg = self.text(self.ffmpegField)
-            if FileManager.default.fileExists(atPath: ffmpeg) {
-                let output = try self.capture([ffmpeg, "-hide_banner", "-filters"])
-                self.log("ffmpeg libass filter: \(output.contains(" ass ") ? "OK" : "Missing")")
-            }
-        }
-    }
-
-    @objc func runEnglishSRT() {
-        start { try self.generateEnglishSRT() }
-    }
-
-    @objc func translateENToZH() {
-        start { try self.translateEnglishToChinese() }
-    }
-
-    @objc func mergeAndBurn() {
-        start { try self.mergeBurn() }
-    }
-
-    @objc func runAll() {
-        start {
-            try self.generateEnglishSRT()
-            try self.translateEnglishToChinese()
-            try self.mergeBurn()
-        }
-    }
-
-    func start(_ work: @escaping () throws -> Void) {
-        if running {
-            alert("A job is already running.")
-            return
-        }
-        running = true
-        DispatchQueue.global(qos: .userInitiated).async {
+    private static func translateRange(
+        _ cues: [Cue], start: Int, end: Int, maxChunkSize: Int,
+        translated: inout [String],
+        log: @escaping (String) -> Void,
+        callAPI: @escaping ([Cue]) async throws -> [Int: String]
+    ) async throws {
+        var cursor = start
+        while cursor < end {
+            let chunkEnd = min(cursor + maxChunkSize, end)
+            let chunk = Array(cues[cursor..<chunkEnd])
+            log("Translating cues \(cursor + 1)–\(chunkEnd) of \(cues.count)…")
             do {
-                try work()
-                self.log("Done.")
+                let result = try await callAPI(chunk)
+                for i in cursor..<chunkEnd {
+                    guard let text = result[cues[i].index],
+                          !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                        throw SubtitleError.translationMissingCue(cues[i].index)
+                    }
+                    translated[i] = text
+                }
+                cursor = chunkEnd
             } catch {
-                self.log("Error: \(error.localizedDescription)")
-                self.alert(error.localizedDescription)
+                let count = chunkEnd - cursor
+                if count == 1 { throw error }
+                let smaller = max(1, count / 2)
+                log("Retrying cues \(cursor + 1)–\(chunkEnd) in smaller batches: \(error.localizedDescription)")
+                try await translateRange(cues, start: cursor, end: chunkEnd,
+                                         maxChunkSize: smaller, translated: &translated,
+                                         log: log, callAPI: callAPI)
+                cursor = chunkEnd
             }
-            self.running = false
         }
     }
 
-    func generateEnglishSRT() throws {
-        let source = try requireSource()
-        let ffmpeg = try requireTool(text(ffmpegField), "ffmpeg")
-        let whisper = try requireTool(text(whisperField), "whisper")
-        let paths = makePaths(source)
+    /// Build the JSON translation prompt.
+    static func prompt(for cues: [Cue]) throws -> String {
+        let items: [[String: Any]] = cues.map { ["id": $0.index, "text": $0.text] }
+        let data = try JSONSerialization.data(withJSONObject: items)
+        let json = String(data: data, encoding: .utf8) ?? "[]"
+        return """
+        Translate the `text` field of each object in this JSON array from English into Traditional Chinese.
+        Keep subtitles natural and concise for burned-in video.
+        Preserve every `id` exactly.
+        Do not merge, omit, renumber, reorder, or add items.
+        Return only a valid JSON array of objects shaped exactly like:
+        [{"id": 1, "text": "翻譯"}]
+        No Markdown, no code fences.
+
+        \(json)
+        """
+    }
+
+    /// Parse a JSON array of {id, text} objects into a dictionary.
+    static func parseJSONResult(_ raw: String, expectedIDs: Set<Int>) throws -> [Int: String] {
+        var text = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        // Strip optional markdown fences
+        if text.hasPrefix("```") {
+            text = text
+                .replacingOccurrences(of: "```json", with: "")
+                .replacingOccurrences(of: "```", with: "")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        guard let data = text.data(using: .utf8),
+              let array = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] else {
+            throw SubtitleError.badTranslationJSON(text)
+        }
+        var result: [Int: String] = [:]
+        for obj in array {
+            guard let id = obj["id"] as? Int, let t = obj["text"] as? String else {
+                throw SubtitleError.missingIDOrText(String(describing: obj))
+            }
+            result[id] = t
+        }
+        let actual = Set(result.keys)
+        guard actual == expectedIDs else {
+            let missing = expectedIDs.subtracting(actual).sorted()
+            let extra = actual.subtracting(expectedIDs).sorted()
+            throw SubtitleError.translationIDMismatch(missing: missing, extra: extra)
+        }
+        return result
+    }
+
+    /// Perform an HTTP POST and return the response body as Data.
+    static func post(url: URL, body: [String: Any], headers: [String: String]) async throws -> Data {
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.timeoutInterval = 120
+        for (k, v) in headers { request.setValue(v, forHTTPHeaderField: k) }
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try JSONSerialization.data(withJSONObject: body)
+
+        let (data, response) = try await URLSession.shared.data(for: request)
+        if let http = response as? HTTPURLResponse, !(200...299).contains(http.statusCode) {
+            let detail = String(data: data, encoding: .utf8) ?? "(no body)"
+            throw SubtitleError.httpError(http.statusCode, detail)
+        }
+        return data
+    }
+}
+
+// MARK: - Error type
+
+public enum SubtitleError: LocalizedError {
+    case missingSource
+    case missingTool(String)
+    case missingFile(String)
+    case missingAPIKey(String)
+    case translationMissingCue(Int)
+    case badTranslationJSON(String)
+    case missingIDOrText(String)
+    case translationIDMismatch(missing: [Int], extra: [Int])
+    case httpError(Int, String)
+    case whisperOutputNotFound(String)
+    case commandFailed(Int, String)
+    case noFontFound
+    case emptySRT(String)
+    case cancelled
+
+    public var errorDescription: String? {
+        switch self {
+        case .missingSource:            return "Choose a source video first."
+        case .missingTool(let n):       return "\(n) not found. Install it and set its path."
+        case .missingFile(let p):       return "File not found: \(p)"
+        case .missingAPIKey(let p):     return "Enter a \(p) API key to auto-translate."
+        case .translationMissingCue(let i): return "Translation missing cue \(i)."
+        case .badTranslationJSON(let s): return "Translation was not valid JSON: \(s)"
+        case .missingIDOrText(let s):   return "Translation item missing id/text: \(s)"
+        case .translationIDMismatch(let m, let e):
+            return "Translation ID mismatch. Missing: \(m), extra: \(e)."
+        case .httpError(let code, let detail): return "HTTP \(code): \(detail)"
+        case .whisperOutputNotFound(let p): return "Whisper did not create expected SRT: \(p)"
+        case .commandFailed(let code, let cmd): return "Command exited \(code): \(cmd)"
+        case .noFontFound:
+            return "No CJK font found. Install a font or set a custom path in Settings."
+        case .emptySRT(let label):      return "\(label) SRT has no cues."
+        case .cancelled:                return "Job cancelled."
+        }
+    }
+}
+
+// MARK: - OpenAI provider
+
+public struct OpenAITranslationService: TranslationService {
+    public let providerName = "OpenAI"
+
+    public init() {}
+
+    public func translate(cues: [Cue], model: String, apiKey: String) async throws -> [Cue] {
+        try await TranslationHelpers.translateAll(cues: cues, model: model, apiKey: apiKey,
+                                                   log: { _ in }) { chunk in
+            try await callAPI(chunk: chunk, model: model, apiKey: apiKey)
+        }
+    }
+
+    func callAPI(chunk: [Cue], model: String, apiKey: String) async throws -> [Int: String] {
+        let prompt = try TranslationHelpers.prompt(for: chunk)
+        let body: [String: Any] = [
+            "model": model,
+            "instructions": "You are a professional subtitle translator. Return only valid JSON.",
+            "input": prompt
+        ]
+        let data = try await TranslationHelpers.post(
+            url: URL(string: "https://api.openai.com/v1/responses")!,
+            body: body,
+            headers: ["Authorization": "Bearer \(apiKey)"]
+        )
+        let raw = try extractOpenAIText(from: data)
+        let expectedIDs = Set(chunk.map(\.index))
+        return try TranslationHelpers.parseJSONResult(raw, expectedIDs: expectedIDs)
+    }
+
+    private func extractOpenAIText(from data: Data) throws -> String {
+        let obj = try JSONSerialization.jsonObject(with: data) as? [String: Any]
+        if let text = obj?["output_text"] as? String { return text }
+        if let output = obj?["output"] as? [[String: Any]] {
+            let parts = output.flatMap { item -> [String] in
+                (item["content"] as? [[String: Any]] ?? []).compactMap { $0["text"] as? String }
+            }
+            if !parts.isEmpty { return parts.joined(separator: "\n") }
+        }
+        throw SubtitleError.badTranslationJSON(String(data: data, encoding: .utf8) ?? "")
+    }
+}
+
+// MARK: - Chat Completions provider (DeepSeek / Kimi)
+
+public struct ChatCompletionsService: TranslationService {
+    public let providerName: String
+    let baseURL: String
+
+    public init(provider: String) {
+        self.providerName = provider
+        switch provider {
+        case "DeepSeek": baseURL = "https://api.deepseek.com"
+        case "Kimi 2.5": baseURL = "https://api.moonshot.ai/v1"
+        default: baseURL = "https://api.openai.com/v1"
+        }
+    }
+
+    public func translate(cues: [Cue], model: String, apiKey: String) async throws -> [Cue] {
+        try await TranslationHelpers.translateAll(cues: cues, model: model, apiKey: apiKey,
+                                                   log: { _ in }) { chunk in
+            try await callAPI(chunk: chunk, model: model, apiKey: apiKey)
+        }
+    }
+
+    func callAPI(chunk: [Cue], model: String, apiKey: String) async throws -> [Int: String] {
+        let prompt = try TranslationHelpers.prompt(for: chunk)
+        let body: [String: Any] = [
+            "model": model,
+            "messages": [
+                ["role": "system", "content": "You are a professional subtitle translator. Return only valid JSON."],
+                ["role": "user", "content": prompt]
+            ],
+            "temperature": 0.2
+        ]
+        let data = try await TranslationHelpers.post(
+            url: URL(string: "\(baseURL)/chat/completions")!,
+            body: body,
+            headers: ["Authorization": "Bearer \(apiKey)"]
+        )
+        let obj = try JSONSerialization.jsonObject(with: data) as? [String: Any]
+        guard let content = (obj?["choices"] as? [[String: Any]])?.first?["message"] as? [String: Any],
+              let text = content["content"] as? String else {
+            throw SubtitleError.badTranslationJSON(String(data: data, encoding: .utf8) ?? "")
+        }
+        return try TranslationHelpers.parseJSONResult(text, expectedIDs: Set(chunk.map(\.index)))
+    }
+}
+
+// MARK: - Gemini provider
+
+public struct GeminiTranslationService: TranslationService {
+    public let providerName = "Google Gemini"
+
+    public init() {}
+
+    public func translate(cues: [Cue], model: String, apiKey: String) async throws -> [Cue] {
+        try await TranslationHelpers.translateAll(cues: cues, model: model, apiKey: apiKey,
+                                                   log: { _ in }) { chunk in
+            try await callAPI(chunk: chunk, model: model, apiKey: apiKey)
+        }
+    }
+
+    func callAPI(chunk: [Cue], model: String, apiKey: String) async throws -> [Int: String] {
+        let prompt = try TranslationHelpers.prompt(for: chunk)
+        let escaped = model.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? model
+        let url = URL(string: "https://generativelanguage.googleapis.com/v1beta/models/\(escaped):generateContent")!
+        let body: [String: Any] = [
+            "contents": [["role": "user", "parts": [["text": "You are a professional subtitle translator. Return only valid JSON.\n\n\(prompt)"]]]],
+            "generationConfig": ["temperature": 0.2, "thinkingConfig": ["thinkingBudget": 0]]
+        ]
+        let data = try await TranslationHelpers.post(url: url, body: body, headers: ["x-goog-api-key": apiKey])
+        let obj = try JSONSerialization.jsonObject(with: data) as? [String: Any]
+        let text = ((obj?["candidates"] as? [[String: Any]])?.first?["content"] as? [String: Any])?["parts"] as? [[String: Any]]
+        let joined = text?.compactMap { $0["text"] as? String }.joined(separator: "\n") ?? ""
+        guard !joined.isEmpty else {
+            throw SubtitleError.badTranslationJSON(String(data: data, encoding: .utf8) ?? "")
+        }
+        return try TranslationHelpers.parseJSONResult(joined, expectedIDs: Set(chunk.map(\.index)))
+    }
+}
+
+// MARK: - Factory
+
+public struct TranslationServiceFactory {
+    public static func make(for provider: String) -> TranslationService {
+        switch provider {
+        case "OpenAI":        return OpenAITranslationService()
+        case "DeepSeek":      return ChatCompletionsService(provider: "DeepSeek")
+        case "Kimi 2.5":      return ChatCompletionsService(provider: "Kimi 2.5")
+        case "Google Gemini": return GeminiTranslationService()
+        default:              return OpenAITranslationService()
+        }
+    }
+}
+
+/// Writes bilingual ASS subtitle files from paired Chinese + English SRT cue arrays.
+public struct ASSWriter {
+
+    public init() {}
+
+    public func write(
+        zhCues: [Cue],
+        enCues: [Cue],
+        to output: URL,
+        width: Int,
+        height: Int
+    ) throws {
+        guard !zhCues.isEmpty else { throw SubtitleError.emptySRT("Chinese") }
+
+        // Two separate styles:
+        // ZH: larger CJK font, sits above EN
+        // EN: slightly smaller, sits at the very bottom
+        let zhFontSize = max(18, Int(Double(height) * 0.026))  // Chinese — slightly larger
+        let enFontSize = max(16, Int(Double(height) * 0.022))  // English — slightly smaller
+        let marginV    = max(20, Int(Double(height) * 0.030))  // bottom margin for EN line
+        let zhMarginV  = max(20, Int(Double(height) * 0.030)) + enFontSize + max(10, Int(Double(height) * 0.018))
+        let marginH    = max(20, Int(Double(width)  * 0.04))
+        let outline    = max(1,  Int(Double(height) * 0.0015))
+        let styleRow   = "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, " +
+                         "Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, " +
+                         "Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding"
+
+        var lines = [
+            "[Script Info]",
+            "ScriptType: v4.00+",
+            "PlayResX: \(width)",
+            "PlayResY: \(height)",
+            "ScaledBorderAndShadow: yes",
+            "WrapStyle: 0",
+            "",
+            "[V4+ Styles]",
+            styleRow,
+            // EN style: bottom position, smaller font
+            "Style: EN,Arial,\(enFontSize),&H00FFFFFF,&H000000FF,&H00000000,&H88000000," +
+            "0,0,0,0,100,100,0,0,1,\(outline),1,2,\(marginH),\(marginH),\(marginV),1",
+            // ZH style: above EN, larger CJK font
+            "Style: ZH,Heiti SC,\(zhFontSize),&H00FFFFFF,&H000000FF,&H00000000,&H88000000," +
+            "0,0,0,0,100,100,0,0,1,\(outline),1,2,\(marginH),\(marginH),\(zhMarginV),1",
+            "",
+            "[Events]",
+            "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text"
+        ]
+
+        // Each cue = two dialogue lines: one EN (bottom), one ZH (above EN)
+        for (i, zh) in zhCues.enumerated() {
+            let enText = i < enCues.count ? enCues[i].text : ""
+            let start  = ASSTime.fromSRT(zh.start)
+            let end    = ASSTime.fromSRT(zh.end)
+            // EN line at bottom
+            if !enText.isEmpty {
+                lines.append(
+                    "Dialogue: 0,\(start),\(end),EN,,0,0,0,,\(ASSEscape.body(enText))"
+                )
+            }
+            // ZH line above EN
+            lines.append(
+                "Dialogue: 1,\(start),\(end),ZH,,0,0,0,,\(ASSEscape.body(zh.text))"
+            )
+        }
+
+        try lines.joined(separator: "\n")
+            .appending("\n")
+            .write(to: output, atomically: true, encoding: .utf8)
+    }
+}
+import AppKit
+import UniformTypeIdentifiers
+
+// MARK: - Job item (for batch processing)
+
+public struct BatchJob: Identifiable, Equatable {
+    public enum Status: Equatable {
+        case queued
+        case running(step: String)
+        case done
+        case failed(String)
+        case cancelled
+    }
+
+    public let id: UUID
+    public let sourceURL: URL
+    public var status: Status
+
+    public init(sourceURL: URL) {
+        self.id = UUID()
+        self.sourceURL = sourceURL
+        self.status = .queued
+    }
+
+    public var displayName: String { sourceURL.lastPathComponent }
+}
+
+// MARK: - Paths
+
+public struct Paths {
+    public let root: URL
+    public let mp4: URL
+    public let wav: URL
+    public let zhSRT: URL
+    public let enSRT: URL
+    public let ass: URL
+    public let burned: URL
+
+    public init(source: URL, outputRoot: URL) {
+        let stem = source.deletingPathExtension().lastPathComponent
+        root    = outputRoot.appendingPathComponent("\(stem)_subtitle_work", isDirectory: true)
+        mp4     = root.appendingPathComponent("\(stem).mp4")
+        wav     = root.appendingPathComponent("\(stem).wav")
+        zhSRT   = root.appendingPathComponent("\(stem).zh.srt")
+        enSRT   = root.appendingPathComponent("\(stem).en.srt")
+        ass     = root.appendingPathComponent("\(stem).zh_en.ass")
+        burned  = root.appendingPathComponent("\(stem)_with_subtitles.mp4")
+    }
+}
+
+// MARK: - Progress
+
+public struct PipelineProgress: Sendable {
+    public let step: String          // human-readable label
+    public let fraction: Double      // 0…1 within current job
+    public let ffmpegTime: String?   // parsed from ffmpeg stderr e.g. "00:01:23"
+
+    public init(step: String, fraction: Double, ffmpegTime: String? = nil) {
+        self.step = step
+        self.fraction = fraction
+        self.ffmpegTime = ffmpegTime
+    }
+}
+
+// MARK: - Runner
+
+public final class PipelineRunner: ObservableObject {
+
+    // Callbacks set by AppDelegate / UI
+    public var onLog: @Sendable (String) -> Void = { _ in }
+    public var onProgress: @Sendable (PipelineProgress) -> Void = { _ in }
+
+    private var cancellationToken = CancellationToken()
+    private var activeProcess: Process?
+
+    // Tool paths (populated by AppDelegate from Settings + UI fields)
+    public nonisolated(unsafe) var ffmpegPath: String  = ""
+    public nonisolated(unsafe) var ffprobePath: String = ""
+    public nonisolated(unsafe) var whisperPath: String = ""
+    public nonisolated(unsafe) var fontPath: String    = ""
+    public nonisolated(unsafe) var syncOffsetSeconds: Double = 0.0  // shift subtitles by N seconds
+
+    public init() {}
+
+    // MARK: - Cancellation
+
+    public nonisolated func cancel() {
+        cancellationToken.cancel()
+        activeProcess?.terminate()
+    }
+
+    private func resetCancellation() {
+        cancellationToken = CancellationToken()
+    }
+
+    // MARK: - Public pipeline steps
+
+    public func runEnglishSRT(source: URL, outputFolder: URL, whisperModel: String) async throws -> URL {
+        resetCancellation()
+        let paths = Paths(source: source, outputRoot: outputFolder)
         try FileManager.default.createDirectory(at: paths.root, withIntermediateDirectories: true)
 
-        try run([ffmpeg, "-y", "-i", source.path, "-c:v", "libx264", "-preset", "fast", "-crf", "22", "-c:a", "aac", "-b:a", "160k", paths.mp4.path])
-        try run([ffmpeg, "-y", "-i", paths.mp4.path, "-vn", "-acodec", "pcm_s16le", "-ar", "16000", paths.wav.path])
-        try run([whisper, paths.wav.path, "--model", selectedModel(), "--language", "en", "--task", "transcribe", "--output_format", "srt", "--output_dir", paths.root.path])
-        let whisperSRT = paths.root.appendingPathComponent("\(paths.wav.deletingPathExtension().lastPathComponent).srt")
+        progress("Converting to H.264 MP4…", 0.05)
+        try checkCancelled()
+        try await run([ffmpegPath, "-y", "-i", source.path,
+                       "-c:v", "libx264", "-preset", "fast", "-crf", "22",
+                       "-c:a", "aac", "-b:a", "160k", paths.mp4.path])
+
+        progress("Extracting audio WAV…", 0.2)
+        try checkCancelled()
+        // Extract WAV directly from original source to avoid any drift from double-conversion
+        try await run([ffmpegPath, "-y", "-i", source.path,
+                       "-vn", "-acodec", "pcm_s16le", "-ar", "16000",
+                       "-ac", "1",          // mono — Whisper works better with mono
+                       paths.wav.path])
+
+        progress("Running Whisper transcription…", 0.35)
+        try checkCancelled()
+        try await run([whisperPath, paths.wav.path,
+                       "--model", whisperModel,
+                       "--language", "en",
+                       "--task", "transcribe",
+                       "--output_format", "srt",
+                       "--output_dir", paths.root.path,
+                       "--word_timestamps", "True",
+                       "--max_line_count", "1",
+                       "--max_line_width", "50",
+                       "--condition_on_previous_text", "False",
+                       "--no_speech_threshold", "0.6",
+                       "--compression_ratio_threshold", "2.4"])
+
+        // Whisper names output after the wav stem
+        let wavStem = paths.wav.deletingPathExtension().lastPathComponent
+        let whisperSRT = paths.root.appendingPathComponent("\(wavStem).srt")
         guard FileManager.default.fileExists(atPath: whisperSRT.path) else {
-            throw message("Whisper finished but did not create the expected SRT: \(whisperSRT.path)")
+            throw SubtitleError.whisperOutputNotFound(whisperSRT.path)
         }
         if whisperSRT.path != paths.enSRT.path {
             if FileManager.default.fileExists(atPath: paths.enSRT.path) {
@@ -309,632 +807,1447 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
             try FileManager.default.moveItem(at: whisperSRT, to: paths.enSRT)
         }
-        setText(englishField, paths.enSRT.path)
-        log("English SRT: \(paths.enSRT.path)")
-        log("Suggested Chinese SRT path: \(paths.zhSRT.path)")
-    }
-
-    func translateEnglishToChinese() throws {
-        let source = try requireSource()
-        let paths = makePaths(source)
-        let english = text(englishField)
-        let enPath = URL(fileURLWithPath: english.isEmpty ? paths.enSRT.path : english)
-        guard FileManager.default.fileExists(atPath: enPath.path) else {
-            throw message("English SRT not found. Generate it first or choose one: \(enPath.path)")
-        }
-        let apiKey = text(apiKeyField).trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !apiKey.isEmpty else {
-            throw message("Enter a \(selectedProvider()) API key to auto-translate, or choose an existing Chinese SRT manually.")
-        }
-        log("Translating English SRT to Chinese with \(selectedProvider())...")
-        let translated = try translateSRT(enPath, apiKey: apiKey, provider: selectedProvider(), model: translateModel())
-        try translated.write(to: paths.zhSRT, atomically: true, encoding: .utf8)
-        setText(chineseField, paths.zhSRT.path)
-        log("Chinese SRT: \(paths.zhSRT.path)")
-    }
-
-    func mergeBurn() throws {
-        let source = try requireSource()
-        let ffmpeg = try requireTool(text(ffmpegField), "ffmpeg")
-        let paths = makePaths(source)
-        let english = text(englishField)
-        let enPath = english.isEmpty ? paths.enSRT.path : english
-        let chinese = text(chineseField)
-        let zhPath = chinese.isEmpty ? paths.zhSRT.path : chinese
-        guard FileManager.default.fileExists(atPath: paths.mp4.path) else { throw message("MP4 not found. Run Steps 1-3 first: \(paths.mp4.path)") }
-        guard FileManager.default.fileExists(atPath: zhPath) else { throw message("Chinese SRT not found. Translate first or choose one: \(zhPath)") }
-        guard FileManager.default.fileExists(atPath: enPath) else { throw message("English SRT not found. Generate it first or choose one: \(enPath)") }
-        guard FileManager.default.fileExists(atPath: "/System/Library/Fonts/STHeiti Medium.ttc") else { throw message("Required font not found: /System/Library/Fonts/STHeiti Medium.ttc") }
-
-        let size = videoSize(paths.mp4)
-        log("Video resolution for ASS PlayRes: \(Int(size.width))x\(Int(size.height))")
-        try writeASS(zh: URL(fileURLWithPath: zhPath), en: URL(fileURLWithPath: enPath), out: paths.ass, width: Int(size.width), height: Int(size.height))
-        log("ASS subtitles: \(paths.ass.path)")
-        let filter = "ass='\(filterEscape(paths.ass.path))':fontsdir='/System/Library/Fonts'"
-        try run([ffmpeg, "-y", "-i", paths.mp4.path, "-vf", filter, "-c:v", "libx264", "-preset", "fast", "-crf", "22", "-c:a", "aac", "-b:a", "160k", paths.burned.path])
-        log("Burned video: \(paths.burned.path)")
-    }
-
-    func requireSource() throws -> URL {
-        let path = text(sourceField).trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !path.isEmpty, FileManager.default.fileExists(atPath: path) else { throw message("Choose a source video first.") }
-        let outputText = text(outputField)
-        let output = outputText.isEmpty ? URL(fileURLWithPath: path).deletingLastPathComponent().path : outputText
-        try FileManager.default.createDirectory(atPath: output, withIntermediateDirectories: true)
-        return URL(fileURLWithPath: path)
-    }
-
-    func requireTool(_ path: String, _ name: String) throws -> String {
-        guard !path.isEmpty, FileManager.default.fileExists(atPath: path) else { throw message("\(name) was not found. Install it, then set its path.") }
-        return path
-    }
-
-    func makePaths(_ source: URL) -> Paths {
-        let outputText = text(outputField)
-        let output = URL(fileURLWithPath: outputText.isEmpty ? source.deletingLastPathComponent().path : outputText)
-        let stem = source.deletingPathExtension().lastPathComponent
-        let root = output.appendingPathComponent("\(stem)_subtitle_work", isDirectory: true)
-        return Paths(
-            root: root,
-            mp4: root.appendingPathComponent("\(stem).mp4"),
-            wav: root.appendingPathComponent("\(stem).wav"),
-            zhSRT: root.appendingPathComponent("\(stem).zh.srt"),
-            enSRT: root.appendingPathComponent("\(stem).en.srt"),
-            ass: root.appendingPathComponent("\(stem).zh_en.ass"),
-            burned: root.appendingPathComponent("\(stem)_with_subtitles.mp4")
-        )
-    }
-
-    func run(_ args: [String]) throws {
-        log("$ \(args.joined(separator: " "))")
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: args[0])
-        process.arguments = Array(args.dropFirst())
-        var env = ProcessInfo.processInfo.environment
-        env["PATH"] = "\(appBinDir):/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:" + (env["PATH"] ?? "")
-        process.environment = env
-        let pipe = Pipe()
-        process.standardOutput = pipe
-        process.standardError = pipe
-        try process.run()
-        let handle = pipe.fileHandleForReading
-        handle.readabilityHandler = { h in
-            let data = h.availableData
-            if !data.isEmpty, let text = String(data: data, encoding: .utf8) {
-                text.split(whereSeparator: \.isNewline).forEach { self.log(String($0)) }
-            }
-        }
-        process.waitUntilExit()
-        handle.readabilityHandler = nil
-        if process.terminationStatus != 0 {
-            throw message("Command failed with exit code \(process.terminationStatus): \(args[0])")
-        }
-    }
-
-    func capture(_ args: [String]) throws -> String {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: args[0])
-        process.arguments = Array(args.dropFirst())
-        let pipe = Pipe()
-        process.standardOutput = pipe
-        process.standardError = pipe
-        try process.run()
-        process.waitUntilExit()
-        return String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-    }
-
-    func videoSize(_ url: URL) -> CGSize {
-        let ffprobe = text(ffprobeField)
-        guard FileManager.default.fileExists(atPath: ffprobe) else { return CGSize(width: 1920, height: 1080) }
+        // Post-process: split long multi-sentence cues for better readability
         do {
-            let json = try capture([ffprobe, "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height", "-of", "json", url.path])
-            let data = Data(json.utf8)
-            if let object = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-               let streams = object["streams"] as? [[String: Any]],
-               let first = streams.first,
-               let width = first["width"] as? Int,
-               let height = first["height"] as? Int {
-                return CGSize(width: width, height: height)
+            let parser = SRTParser()
+            let rawCues = try parser.parse(paths.enSRT)
+            let splitCues = splitLongCues(rawCues)
+            if splitCues.count > rawCues.count {
+                var lines: [String] = []
+                for cue in splitCues {
+                    lines.append("\(cue.index)")
+                    lines.append("\(cue.start) --> \(cue.end)")
+                    lines.append(cue.text)
+                    lines.append("")
+                }
+                try lines.joined(separator: "\n")
+                    .write(to: paths.enSRT, atomically: true, encoding: .utf8)
+                log("Split \(rawCues.count) cues → \(splitCues.count) cues for better sync")
             }
-        } catch {
-            log("Could not read video size with ffprobe; using 1920x1080.")
+        } catch { log("SRT split skipped: \(error.localizedDescription)") }
+
+        // Apply sync offset if set
+        if abs(syncOffsetSeconds) > 0.01 {
+            do {
+                let parser = SRTParser()
+                let cues = try parser.parse(paths.enSRT)
+                let shifted = cues.map { cue -> Cue in
+                    let s = shiftSRTTime(cue.start, by: syncOffsetSeconds)
+                    let e = shiftSRTTime(cue.end,   by: syncOffsetSeconds)
+                    return Cue(index: cue.index, start: s, end: e, text: cue.text)
+                }.filter { srtTimeToSeconds($0.start) >= 0 }
+                var lines: [String] = []
+                for cue in shifted {
+                    lines.append("\(cue.index)")
+                    lines.append("\(cue.start) --> \(cue.end)")
+                    lines.append(cue.text); lines.append("")
+                }
+                try lines.joined(separator: "\n")
+                    .write(to: paths.enSRT, atomically: true, encoding: .utf8)
+                log("Applied sync offset: \(syncOffsetSeconds > 0 ? "+" : "")\(String(format: "%.2f", syncOffsetSeconds))s")
+            } catch { log("Sync offset skipped: \(error.localizedDescription)") }
+        }
+
+        progress("English SRT ready.", 1.0)
+        log("English SRT: \(paths.enSRT.path)")
+        return paths.enSRT
+    }
+
+    public func translateSRT(
+        enSRT: URL,
+        zhSRT: URL,
+        provider: String,
+        model: String,
+        apiKey: String
+    ) async throws -> URL {
+        resetCancellation()
+        let parser = SRTParser()
+        let cues = try parser.parse(enSRT)
+        guard !cues.isEmpty else { throw SubtitleError.emptySRT("English") }
+
+        progress("Translating with \(provider)…", 0.1)
+        let service = TranslationServiceFactory.make(for: provider)
+
+        // Inject logging
+        var translated: [Cue] = []
+        let total = cues.count
+        var done = 0
+        let chunk = 24
+        var cursor = 0
+        while cursor < total {
+            try checkCancelled()
+            let end = min(cursor + chunk, total)
+            let slice = Array(cues[cursor..<end])
+            let result = try await service.translate(cues: slice, model: model, apiKey: apiKey)
+            translated.append(contentsOf: result)
+            done += result.count
+            progress("Translated \(done)/\(total) cues…", Double(done) / Double(total))
+            cursor = end
+        }
+
+        // Write Chinese SRT
+        var lines: [String] = []
+        for (i, cue) in cues.enumerated() {
+            lines.append("\(i + 1)")
+            lines.append("\(cue.start) --> \(cue.end)")
+            lines.append(i < translated.count ? translated[i].text : "")
+            lines.append("")
+        }
+        try lines.joined(separator: "\n").write(to: zhSRT, atomically: true, encoding: .utf8)
+        progress("Chinese SRT ready.", 1.0)
+        log("Chinese SRT: \(zhSRT.path)")
+        return zhSRT
+    }
+
+    public func mergeAndBurn(
+        source: URL,
+        outputFolder: URL,
+        enSRTOverride: String,
+        zhSRTOverride: String
+    ) async throws -> URL {
+        resetCancellation()
+        let paths = Paths(source: source, outputRoot: outputFolder)
+        let enPath = enSRTOverride.isEmpty ? paths.enSRT.path : enSRTOverride
+        let zhPath = zhSRTOverride.isEmpty ? paths.zhSRT.path : zhSRTOverride
+
+        guard FileManager.default.fileExists(atPath: paths.mp4.path) else {
+            throw SubtitleError.missingFile(paths.mp4.path)
+        }
+        guard FileManager.default.fileExists(atPath: zhPath) else {
+            throw SubtitleError.missingFile(zhPath)
+        }
+        guard FileManager.default.fileExists(atPath: enPath) else {
+            throw SubtitleError.missingFile(enPath)
+        }
+        guard !fontPath.isEmpty, FileManager.default.fileExists(atPath: fontPath) else {
+            throw SubtitleError.noFontFound
+        }
+
+        progress("Reading video resolution…", 0.05)
+        let size = videoSize(paths.mp4)
+        log("Video resolution: \(Int(size.width))×\(Int(size.height))")
+
+        progress("Writing ASS subtitles…", 0.1)
+        try checkCancelled()
+        let parser = SRTParser()
+        let zhCues = try parser.parse(URL(fileURLWithPath: zhPath))
+        let enCues = try parser.parse(URL(fileURLWithPath: enPath))
+        let writer = ASSWriter()
+        try writer.write(zhCues: zhCues, enCues: enCues, to: paths.ass,
+                         width: Int(size.width), height: Int(size.height))
+        log("ASS: \(paths.ass.path)")
+
+        progress("Burning subtitles into video…", 0.15)
+        try checkCancelled()
+        let fontDir = URL(fileURLWithPath: fontPath).deletingLastPathComponent().path
+        let filter = "ass='\(ASSEscape.filterPath(paths.ass.path))':fontsdir='\(ASSEscape.filterPath(fontDir))'"
+        try await run([ffmpegPath, "-y",
+                       "-loglevel", "error",      // only show real errors, suppress libass font warnings
+                       "-hide_banner",
+                       "-i", paths.mp4.path,
+                       "-vf", filter,
+                       "-c:v", "libx264", "-preset", "fast", "-crf", "22",
+                       "-c:a", "aac", "-b:a", "160k",
+                       "-stats",                  // still show encoding progress
+                       paths.burned.path])
+        progress("Done!", 1.0)
+        log("Burned video: \(paths.burned.path)")
+        return paths.burned
+    }
+
+    public func runAll(
+        source: URL,
+        outputFolder: URL,
+        whisperModel: String,
+        provider: String,
+        translateModel: String,
+        apiKey: String,
+        enSRTOverride: String,
+        zhSRTOverride: String
+    ) async throws -> URL {
+        let paths = Paths(source: source, outputRoot: outputFolder)
+        let enSRT = try await runEnglishSRT(source: source, outputFolder: outputFolder, whisperModel: whisperModel)
+        let zhSRT = try await translateSRT(enSRT: enSRT, zhSRT: paths.zhSRT,
+                                            provider: provider, model: translateModel, apiKey: apiKey)
+        return try await mergeAndBurn(source: source, outputFolder: outputFolder,
+                                       enSRTOverride: enSRT.path, zhSRTOverride: zhSRT.path)
+    }
+
+    // MARK: - Process execution
+
+    private func run(_ args: [String]) async throws {
+        try checkCancelled()
+        log("$ \(args.joined(separator: " "))")
+        guard FileManager.default.fileExists(atPath: args[0]) else {
+            throw SubtitleError.missingTool(args[0])
+        }
+
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: args[0])
+        process.arguments = Array(args.dropFirst())
+
+        var env = ProcessInfo.processInfo.environment
+        env["PATH"] = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:" + (env["PATH"] ?? "")
+        process.environment = env
+
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = pipe
+
+        let handle = pipe.fileHandleForReading
+        handle.readabilityHandler = { [weak self] h in
+            let data = h.availableData
+            guard !data.isEmpty, let text = String(data: data, encoding: .utf8) else { return }
+            for line in text.split(whereSeparator: \.isNewline) {
+                let s = String(line)
+                self?.log(s)
+                // Parse ffmpeg progress
+                if let time = PipelineRunner.parseFFmpegTime(s) {
+                    let cb = self?.onProgress
+                    DispatchQueue.main.async {
+                        cb?(PipelineProgress(step: "Encoding…", fraction: -1, ffmpegTime: time))
+                    }
+                }
+            }
+        }
+
+        activeProcess = process
+        try process.run()
+
+        // Await completion without blocking the Swift concurrency thread
+        await withCheckedContinuation { continuation in
+            process.terminationHandler = { _ in continuation.resume() }
+        }
+        handle.readabilityHandler = nil
+        activeProcess = nil
+
+        if process.terminationStatus != 0 {
+            throw SubtitleError.commandFailed(Int(process.terminationStatus), args[0])
+        }
+    }
+
+    private func videoSize(_ url: URL) -> CGSize {
+        guard FileManager.default.fileExists(atPath: ffprobePath) else {
+            return CGSize(width: 1920, height: 1080)
+        }
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: ffprobePath)
+        process.arguments = ["-v", "error", "-select_streams", "v:0",
+                             "-show_entries", "stream=width,height", "-of", "json", url.path]
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = Pipe()
+        try? process.run()
+        process.waitUntilExit()
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        if let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           let streams = obj["streams"] as? [[String: Any]],
+           let first = streams.first,
+           let w = first["width"] as? Int, let h = first["height"] as? Int {
+            return CGSize(width: w, height: h)
         }
         return CGSize(width: 1920, height: 1080)
     }
 
-    func translateSRT(_ url: URL, apiKey: String, provider: String, model: String) throws -> String {
-        let cues = try parseSRT(url)
-        guard !cues.isEmpty else { throw message("English SRT has no cues.") }
-        var translated = Array(repeating: "", count: cues.count)
-        try translateCueRange(cues, start: 0, end: cues.count, maxChunkSize: 24, translated: &translated, apiKey: apiKey, provider: provider, model: model)
-
-        var lines: [String] = []
-        for (index, cue) in cues.enumerated() {
-            lines.append("\(index + 1)")
-            lines.append("\(cue.start) --> \(cue.end)")
-            lines.append(translated[index])
-            lines.append("")
-        }
-        return lines.joined(separator: "\n")
+    private func checkCancelled() throws {
+        if cancellationToken.isCancelled { throw SubtitleError.cancelled }
     }
 
-    func translateCueRange(_ cues: [Cue], start: Int, end: Int, maxChunkSize: Int, translated: inout [String], apiKey: String, provider: String, model: String) throws {
-        var cursor = start
-        while cursor < end {
-            let chunkEnd = min(cursor + maxChunkSize, end)
-            do {
-                let result = try translateCueChunk(cues, start: cursor, end: chunkEnd, apiKey: apiKey, provider: provider, model: model)
-                for index in cursor..<chunkEnd {
-                    guard let text = result[index + 1], !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-                        throw message("Translation missing cue \(index + 1).")
-                    }
-                    translated[index] = text
-                }
-                cursor = chunkEnd
-            } catch {
-                let count = chunkEnd - cursor
-                if count == 1 {
-                    throw error
-                }
-                let smaller = max(1, count / 2)
-                log("Retrying cues \(cursor + 1)-\(chunkEnd) in smaller batches because: \(error.localizedDescription)")
-                try translateCueRange(cues, start: cursor, end: chunkEnd, maxChunkSize: smaller, translated: &translated, apiKey: apiKey, provider: provider, model: model)
-                cursor = chunkEnd
-            }
-        }
+    private func progress(_ step: String, _ fraction: Double) {
+        log(step)
+        onProgress(PipelineProgress(step: step, fraction: fraction))
     }
 
-    func translateCueChunk(_ cues: [Cue], start: Int, end: Int, apiKey: String, provider: String, model: String) throws -> [Int: String] {
-        let items = cues[start..<end].enumerated().map { offset, cue -> [String: Any] in
-            [
-                "id": start + offset + 1,
-                "text": cue.text
-            ]
-        }
-        let inputData = try JSONSerialization.data(withJSONObject: items)
-        let inputJSON = String(data: inputData, encoding: .utf8) ?? "[]"
-        let prompt = """
-        Translate the `text` field of each object in this JSON array from English into Traditional Chinese.
-        Keep subtitles natural and concise for burned-in video.
-        Preserve every `id` exactly.
-        Do not merge, omit, renumber, reorder, or add items.
-        Return only a valid JSON array of objects shaped exactly like:
-        [{"id": 1, "text": "翻譯"}]
-        No Markdown.
+    private nonisolated func log(_ msg: String) {
+        let cb = onLog
+        DispatchQueue.main.async { cb(msg) }
+    }
 
-        \(inputJSON)
-        """
-        log("Translating cues \(start + 1)-\(end) of \(cues.count)...")
-        let output: String
-        if provider == "OpenAI" {
-            output = try callOpenAIResponses(input: prompt, apiKey: apiKey, model: model)
-        } else if provider == "Google Gemini" {
-            output = try callGemini(input: prompt, apiKey: apiKey, model: model)
-        } else {
-            output = try callChatCompletions(input: prompt, apiKey: apiKey, provider: provider, model: model)
-        }
-        let objects = try parseJSONObjects(output)
-        var result: [Int: String] = [:]
-        for object in objects {
-            guard let id = object["id"] as? Int,
-                  let text = object["text"] as? String else {
-                throw message("Translation item is missing id/text: \(object)")
+    private nonisolated static func parseFFmpegTime(_ line: String) -> String? {
+        guard line.contains("time=") else { return nil }
+        let parts = line.components(separatedBy: "time=")
+        guard parts.count > 1 else { return nil }
+        let time = parts[1].components(separatedBy: " ")[0]
+        return time.hasPrefix("-") ? nil : time
+    }
+}
+
+
+    // MARK: - SRT post-processing: split long cues at sentence boundaries
+
+    /// Splits cues that contain multiple sentences into separate cues.
+    /// e.g. "A. B. C." → three cues with proportionally divided timing.
+    private func splitLongCues(_ cues: [Cue]) -> [Cue] {
+        var result: [Cue] = []
+        var newIndex = 1
+        for cue in cues {
+            // Split on sentence-ending punctuation followed by space
+            let parts = splitAtSentences(cue.text)
+            if parts.count <= 1 {
+                result.append(Cue(index: newIndex, start: cue.start, end: cue.end, text: cue.text))
+                newIndex += 1
+                continue
             }
-            result[id] = text
-        }
-        let expected = Set((start + 1)...end)
-        let actual = Set(result.keys)
-        guard actual == expected else {
-            let missing = expected.subtracting(actual).sorted()
-            let extra = actual.subtracting(expected).sorted()
-            throw message("Translation id mismatch. Missing: \(missing), extra: \(extra).")
+            // Divide the cue duration proportionally by character count
+            let totalChars = max(1, parts.map(\.count).reduce(0, +))
+            let startSecs = srtTimeToSeconds(cue.start)
+            let endSecs   = srtTimeToSeconds(cue.end)
+            let duration  = endSecs - startSecs
+            var cursor = startSecs
+            for part in parts {
+                let fraction = Double(part.count) / Double(totalChars)
+                let partDur  = max(0.5, duration * fraction)
+                let partEnd  = min(cursor + partDur, endSecs)
+                result.append(Cue(index: newIndex,
+                                  start: secondsToSRTTime(cursor),
+                                  end:   secondsToSRTTime(partEnd),
+                                  text:  part.trimmingCharacters(in: .whitespaces)))
+                cursor = partEnd
+                newIndex += 1
+            }
         }
         return result
     }
 
-    func callOpenAIResponses(input: String, apiKey: String, model: String) throws -> String {
-        let body: [String: Any] = [
-            "model": model,
-            "instructions": "You are a professional subtitle translator. Return only the requested machine-readable output.",
-            "input": input
-        ]
-        let data = try JSONSerialization.data(withJSONObject: body)
-        var request = URLRequest(url: URL(string: "https://api.openai.com/v1/responses")!)
-        request.httpMethod = "POST"
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
-        request.httpBody = data
+    private func splitAtSentences(_ text: String) -> [String] {
+        // Split on ". ", "? ", "! ", "。", "？", "！" but keep short cues intact
+        guard text.count > 50 else { return [text] }
+        var parts: [String] = []
+        var current = ""
+        var i = text.startIndex
+        while i < text.endIndex {
+            let ch = text[i]
+            current.append(ch)
+            let next = text.index(after: i)
+            let isEndPunct = ".?!。？！".contains(ch)
+            let nextIsSpace = next < text.endIndex && (text[next] == " " || text[next] == "\n")
+            if isEndPunct && (nextIsSpace || next == text.endIndex) && current.count > 15 {
+                parts.append(current.trimmingCharacters(in: .whitespaces))
+                current = ""
+                // skip the space
+                if nextIsSpace { i = text.index(after: next); continue }
+            }
+            i = next
+        }
+        if !current.trimmingCharacters(in: .whitespaces).isEmpty {
+            parts.append(current.trimmingCharacters(in: .whitespaces))
+        }
+        return parts.filter { !$0.isEmpty }
+    }
 
-        let semaphore = DispatchSemaphore(value: 0)
-        var responseData: Data?
-        var response: URLResponse?
-        var responseError: Error?
-        URLSession.shared.dataTask(with: request) { data, urlResponse, error in
-            responseData = data
-            response = urlResponse
-            responseError = error
-            semaphore.signal()
-        }.resume()
-        semaphore.wait()
+    private func srtTimeToSeconds(_ t: String) -> Double {
+        // "00:01:23,456" → seconds
+        let clean = t.replacingOccurrences(of: ",", with: ".")
+        let parts = clean.components(separatedBy: ":")
+        guard parts.count == 3 else { return 0 }
+        let h = Double(parts[0]) ?? 0
+        let m = Double(parts[1]) ?? 0
+        let s = Double(parts[2]) ?? 0
+        return h * 3600 + m * 60 + s
+    }
 
-        if let responseError {
-            throw responseError
+    private func secondsToSRTTime(_ t: Double) -> String {
+        let h   = Int(t / 3600)
+        let m   = Int((t.truncatingRemainder(dividingBy: 3600)) / 60)
+        let s   = Int(t.truncatingRemainder(dividingBy: 60))
+        let ms  = Int((t - Double(Int(t))) * 1000)
+        return String(format: "%02d:%02d:%02d,%03d", h, m, s, ms)
+    }
+
+    private func shiftSRTTime(_ time: String, by offset: Double) -> String {
+        let secs = srtTimeToSeconds(time) + offset
+        let clamped = max(0, secs)
+        return secondsToSRTTime(clamped)
+    }
+
+// MARK: - Cancellation token
+
+final class CancellationToken: @unchecked Sendable {
+    private(set) var isCancelled = false
+    private let lock = NSLock()
+
+    func cancel() {
+        lock.lock(); defer { lock.unlock() }
+        isCancelled = true
+    }
+}
+// SubtitleBurnerApp.swift
+// Refactored: modular pipeline, async/await, Keychain, UserDefaults,
+// progress bar, cancel, drag-and-drop, batch processing, font picker.
+
+
+// MARK: - AppDelegate
+
+@MainActor
+final class AppDelegate: NSObject, NSApplicationDelegate {
+
+    var window: NSWindow!
+
+    // MARK: UI fields
+    let outputField          = NSTextField()
+    let englishField         = NSTextField()
+    let chineseField         = NSTextField()
+    let ffmpegField          = NSTextField()
+    let ffprobeField         = NSTextField()
+    let whisperField         = NSTextField()
+    let apiKeyField          = NSSecureTextField()
+    let translateModelField  = NSTextField()
+    let fontField            = NSTextField()
+    let modelPopup           = NSPopUpButton()
+    let providerPopup        = NSPopUpButton()
+    let progressBar          = NSProgressIndicator()
+    let progressLabel        = NSTextField(labelWithString: "")
+    let syncOffsetField      = NSTextField()   // e.g. "-0.5" to shift back 0.5s
+    let cancelButton         = NSButton()
+    let logView              = NSTextView()
+
+    // Batch table
+    let batchTableView       = NSTableView()
+    var batchJobs: [BatchJob] = []
+    var batchScrollView: NSScrollView!
+
+    // Runner
+    let runner = PipelineRunner()
+    var currentTask: Task<Void, Never>?
+
+    // MARK: - Lifecycle
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        buildUI()
+        restoreSettings()
+    }
+
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
+
+    // MARK: - Settings persistence
+
+    func restoreSettings() {
+        outputField.stringValue         = Settings.outputFolder
+        ffmpegField.stringValue         = Settings.ffmpegPath.isEmpty   ? findTool("ffmpeg")   : Settings.ffmpegPath
+        ffprobeField.stringValue        = Settings.ffprobePath.isEmpty  ? findTool("ffprobe")  : Settings.ffprobePath
+        whisperField.stringValue        = Settings.whisperPath.isEmpty  ? findTool("whisper")  : Settings.whisperPath
+        fontField.stringValue           = Settings.fontPath
+        translateModelField.stringValue = Settings.translateModel
+
+        // Restore popup selections
+        let providers = ["OpenAI", "DeepSeek", "Kimi 2.5", "Google Gemini"]
+        if let idx = providers.firstIndex(of: Settings.translateProvider) {
+            providerPopup.selectItem(at: idx)
         }
-        if let http = response as? HTTPURLResponse, !(200...299).contains(http.statusCode) {
-            let detail = responseData.flatMap { String(data: $0, encoding: .utf8) } ?? "No response body."
-            throw message("OpenAI API returned HTTP \(http.statusCode): \(detail)")
+        let models = ["turbo", "small", "medium", "large-v3"]
+        if let idx = models.firstIndex(of: Settings.whisperModel) {
+            modelPopup.selectItem(at: idx)
         }
-        guard let responseData else {
-            throw message("OpenAI API returned no data.")
+
+        // Load API key from Keychain
+        apiKeyField.stringValue = KeychainStore.load(for: selectedProvider()) ?? ""
+    }
+
+    func saveSettings() {
+        Settings.outputFolder      = outputField.stringValue
+        Settings.ffmpegPath        = ffmpegField.stringValue
+        Settings.ffprobePath       = ffprobeField.stringValue
+        Settings.whisperPath       = whisperField.stringValue
+        Settings.translateProvider = selectedProvider()
+        Settings.translateModel    = translateModelField.stringValue
+        Settings.whisperModel      = selectedModel()
+        Settings.fontPath          = fontField.stringValue
+
+        // Persist API key to Keychain
+        let key = apiKeyField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        if key.isEmpty {
+            KeychainStore.delete(for: selectedProvider())
+        } else {
+            KeychainStore.save(key: key, for: selectedProvider())
         }
-        let object = try JSONSerialization.jsonObject(with: responseData) as? [String: Any]
-        if let outputText = object?["output_text"] as? String {
-            return outputText
+    }
+
+    // MARK: - UI Construction
+
+    func buildUI() {
+        window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 1100, height: 760),
+            styleMask: [.titled, .closable, .miniaturizable, .resizable],
+            backing: .buffered, defer: false
+        )
+        window.title = "SubtitleBurner"
+        window.titlebarAppearsTransparent = true
+        window.backgroundColor = NSColor(red: 0.08, green: 0.06, blue: 0.13, alpha: 1)
+        window.appearance = NSAppearance(named: .darkAqua)
+        window.center()
+        window.minSize = NSSize(width: 900, height: 640)
+        window.contentView?.registerForDraggedTypes([.fileURL])
+
+        let cv = window.contentView!
+        cv.wantsLayer = true
+        cv.layer?.backgroundColor = NSColor(red: 0.08, green: 0.06, blue: 0.13, alpha: 1).cgColor
+
+        // ── Title bar ────────────────────────────────────────────────
+        let titleBar = NSView()
+        titleBar.wantsLayer = true
+        titleBar.layer?.backgroundColor = NSColor(red: 0.10, green: 0.08, blue: 0.16, alpha: 1).cgColor
+        titleBar.translatesAutoresizingMaskIntoConstraints = false
+        cv.addSubview(titleBar)
+
+        let appIconLabel = mkLabel("⬛", 18, .regular, NSColor(red: 0.55, green: 0.35, blue: 0.95, alpha: 1))
+        let appTitleLabel = mkLabel("SubtitleBurner", 17, .bold, .white)
+        let appSubLabel   = mkLabel("Pro Workspace", 13, .regular, NSColor(white: 1, alpha: 0.45))
+        let titleLeft = hstack([appIconLabel, appTitleLabel, appSubLabel], spacing: 8)
+
+        // Status indicator
+        let statusDotField = NSTextField(labelWithString: "●")
+        statusDotField.font = .systemFont(ofSize: 10)
+        statusDotField.textColor = NSColor(red: 0.3, green: 0.9, blue: 0.5, alpha: 1)
+        let statusTextField = mkLabel("Ready", 13, .regular, NSColor(white: 1, alpha: 0.5))
+        // Store references for later update
+        objc_setAssociatedObject(self, &AssocKeys.statusDot,  statusDotField,  .OBJC_ASSOCIATION_RETAIN)
+        objc_setAssociatedObject(self, &AssocKeys.statusText, statusTextField, .OBJC_ASSOCIATION_RETAIN)
+        let statusBadge = hstack([statusDotField, statusTextField], spacing: 4)
+        statusBadge.wantsLayer = true
+        statusBadge.layer?.backgroundColor = NSColor(white: 1, alpha: 0.07).cgColor
+        statusBadge.layer?.cornerRadius = 10
+        statusBadge.edgeInsets = NSEdgeInsets(top: 4, left: 10, bottom: 4, right: 10)
+
+        titleLeft.translatesAutoresizingMaskIntoConstraints = false
+        statusBadge.translatesAutoresizingMaskIntoConstraints = false
+        titleBar.addSubview(titleLeft)
+        titleBar.addSubview(statusBadge)
+        NSLayoutConstraint.activate([
+            titleBar.leadingAnchor.constraint(equalTo: cv.leadingAnchor),
+            titleBar.trailingAnchor.constraint(equalTo: cv.trailingAnchor),
+            titleBar.topAnchor.constraint(equalTo: cv.topAnchor),
+            titleBar.heightAnchor.constraint(equalToConstant: 52),
+            titleLeft.leadingAnchor.constraint(equalTo: titleBar.leadingAnchor, constant: 80),
+            titleLeft.centerYAnchor.constraint(equalTo: titleBar.centerYAnchor),
+            statusBadge.trailingAnchor.constraint(equalTo: titleBar.trailingAnchor, constant: -16),
+            statusBadge.centerYAnchor.constraint(equalTo: titleBar.centerYAnchor),
+        ])
+
+        let titleDiv = hDivider()
+        titleDiv.translatesAutoresizingMaskIntoConstraints = false
+        cv.addSubview(titleDiv)
+        NSLayoutConstraint.activate([
+            titleDiv.leadingAnchor.constraint(equalTo: cv.leadingAnchor),
+            titleDiv.trailingAnchor.constraint(equalTo: cv.trailingAnchor),
+            titleDiv.topAnchor.constraint(equalTo: titleBar.bottomAnchor),
+            titleDiv.heightAnchor.constraint(equalToConstant: 1),
+        ])
+
+        // ── Left panel (scroll) ───────────────────────────────────────
+        let leftScroll = NSScrollView()
+        leftScroll.drawsBackground = false
+        leftScroll.hasVerticalScroller = true
+        leftScroll.translatesAutoresizingMaskIntoConstraints = false
+
+        let leftStack = NSStackView()
+        leftStack.orientation = .vertical
+        leftStack.spacing = 0
+        leftStack.alignment = .leading
+        leftStack.translatesAutoresizingMaskIntoConstraints = false
+        leftScroll.documentView = leftStack
+        NSLayoutConstraint.activate([
+            leftStack.widthAnchor.constraint(equalTo: leftScroll.contentView.widthAnchor)
+        ])
+
+        // Source Video section
+        leftStack.addArrangedSubview(sectionHeader("SOURCE VIDEO", icon: "🎬"))
+        let sourceRow = fieldRow(field: outputField, placeholder: "/Users/…/video.mp4",
+                                  buttonTitle: "Choose", action: #selector(chooseOutput))
+        leftStack.addArrangedSubview(padded(sourceRow))
+
+        leftStack.addArrangedSubview(sectionHeader("OUTPUT FOLDER", icon: "📁"))
+        leftStack.addArrangedSubview(padded(fieldRow(field: outputField, placeholder: "~/Downloads",
+                                                      buttonTitle: "Choose", action: #selector(chooseOutput))))
+
+        leftStack.addArrangedSubview(spacer(12))
+
+        leftStack.addArrangedSubview(sectionHeader("ENGLISH .SRT (AUTO-GENERATED)", icon: "📄"))
+        leftStack.addArrangedSubview(padded(fieldRow(field: englishField, placeholder: "Auto-generated after processing",
+                                                      buttonTitle: "Browse", action: #selector(chooseEnglishSRT))))
+
+        leftStack.addArrangedSubview(sectionHeader("CHINESE .SRT", icon: "📄"))
+        leftStack.addArrangedSubview(padded(fieldRow(field: chineseField, placeholder: "Leave empty to auto-generate",
+                                                      buttonTitle: "Browse", action: #selector(chooseChineseSRT))))
+
+        leftStack.addArrangedSubview(spacer(8))
+        leftStack.addArrangedSubview(purpleDivider())
+        leftStack.addArrangedSubview(spacer(8))
+
+        leftStack.addArrangedSubview(sectionHeader("TRANSLATE MODE", icon: "🌐"))
+        providerPopup.removeAllItems()
+        providerPopup.addItems(withTitles: ["OpenAI", "DeepSeek", "Kimi 2.5", "Google Gemini"])
+        providerPopup.target = self; providerPopup.action = #selector(providerChanged)
+        stylePopup(providerPopup)
+        leftStack.addArrangedSubview(padded(providerPopup))
+
+        leftStack.addArrangedSubview(sectionHeader("API KEY", icon: "🔑"))
+        let apiRow = NSStackView(); apiRow.orientation = .horizontal; apiRow.spacing = 6
+        styleInputField(apiKeyField)
+        apiKeyField.heightAnchor.constraint(equalToConstant: 40).isActive = true
+        let saveKeyBtn = accentButton("Save", action: #selector(saveAPIKey))
+        apiRow.addArrangedSubview(apiKeyField); apiRow.addArrangedSubview(saveKeyBtn)
+        leftStack.addArrangedSubview(padded(apiRow))
+
+        leftStack.addArrangedSubview(sectionHeader("MODEL", icon: "🤖"))
+        let modelRow2 = NSStackView(); modelRow2.orientation = .horizontal; modelRow2.spacing = 6
+        styleInputField(translateModelField)
+        translateModelField.heightAnchor.constraint(equalToConstant: 40).isActive = true
+        let defaultBtn = ghostButton("Default", action: #selector(defaultTranslateModel))
+        modelRow2.addArrangedSubview(translateModelField); modelRow2.addArrangedSubview(defaultBtn)
+        leftStack.addArrangedSubview(padded(modelRow2))
+
+        leftStack.addArrangedSubview(spacer(8))
+        leftStack.addArrangedSubview(purpleDivider())
+        leftStack.addArrangedSubview(spacer(8))
+
+        // Tools (collapsible)
+        leftStack.addArrangedSubview(sectionHeader("TOOLS", icon: "⚙️"))
+        for (lbl, field, sel) in [
+            ("ffmpeg",   ffmpegField,  #selector(chooseFFmpeg)),
+            ("ffprobe",  ffprobeField, #selector(chooseFFprobe)),
+            ("whisper",  whisperField, #selector(chooseWhisper)),
+            ("CJK Font", fontField,    #selector(chooseFont)),
+        ] as [(String, NSTextField, Selector)] {
+            styleInputField(field)
+            field.font = .monospacedSystemFont(ofSize: 13, weight: .regular)
+            field.heightAnchor.constraint(equalToConstant: 36).isActive = true
+            field.setContentHuggingPriority(.defaultLow, for: .horizontal)
+            field.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+            let findBtn = ghostButton("Find", action: sel)
+            findBtn.setContentHuggingPriority(.required, for: .horizontal)
+            let toolRow = NSStackView(); toolRow.orientation = .horizontal; toolRow.spacing = 6
+            toolRow.addArrangedSubview(field); toolRow.addArrangedSubview(findBtn)
+            let lbl2 = mkLabel(lbl, 12, .regular, NSColor(white: 1, alpha: 0.4))
+            let col = NSStackView(); col.orientation = .vertical; col.spacing = 3; col.alignment = .leading
+            col.addArrangedSubview(lbl2); col.addArrangedSubview(toolRow)
+            // Bind col and toolRow to full panel width
+            col.translatesAutoresizingMaskIntoConstraints = false
+            toolRow.translatesAutoresizingMaskIntoConstraints = false
+            leftStack.addArrangedSubview(padded(col))
         }
-        if let output = object?["output"] as? [[String: Any]] {
-            var parts: [String] = []
-            for item in output {
-                if let content = item["content"] as? [[String: Any]] {
-                    for entry in content {
-                        if let text = entry["text"] as? String {
-                            parts.append(text)
-                        }
-                    }
+        // After adding tool rows, bind their widths to leftStack
+        for sub in leftStack.arrangedSubviews.suffix(4) {
+            sub.translatesAutoresizingMaskIntoConstraints = false
+            sub.widthAnchor.constraint(equalTo: leftStack.widthAnchor).isActive = true
+            if let wrapper = sub as? NSStackView, let col = wrapper.arrangedSubviews.first as? NSStackView {
+                col.widthAnchor.constraint(equalTo: wrapper.widthAnchor, constant: -32).isActive = true
+                if let toolRow = col.arrangedSubviews.last as? NSStackView {
+                    toolRow.widthAnchor.constraint(equalTo: col.widthAnchor).isActive = true
                 }
             }
-            if !parts.isEmpty {
-                return parts.joined(separator: "\n")
+        }
+
+        // Whisper model
+        leftStack.addArrangedSubview(sectionHeader("WHISPER MODEL", icon: "🎙"))
+        modelPopup.removeAllItems()
+        modelPopup.addItems(withTitles: ["turbo", "small", "medium", "large-v3"])
+        stylePopup(modelPopup)
+        leftStack.addArrangedSubview(padded(modelPopup))
+
+        leftStack.addArrangedSubview(sectionHeader("SYNC OFFSET (seconds)", icon: "⏱"))
+        syncOffsetField.placeholderString = "0.0  (e.g. -0.5 to shift earlier)"
+        syncOffsetField.stringValue = "0.0"
+        styleInputField(syncOffsetField)
+        syncOffsetField.heightAnchor.constraint(equalToConstant: 36).isActive = true
+        leftStack.addArrangedSubview(padded(syncOffsetField))
+
+        leftStack.addArrangedSubview(spacer(16))
+
+        // ── Action buttons ────────────────────────────────────────────
+        let btnGrid = NSStackView(); btnGrid.orientation = .vertical; btnGrid.spacing = 8
+
+        // Row 1: English SRT | Translate EN→ZH | Merge ASS+Burn  (equal width, one line)
+        let row1 = NSStackView(); row1.orientation = .horizontal; row1.spacing = 6
+        row1.distribution = .fillEqually
+        row1.addArrangedSubview(outlineButton("English SRT",     action: #selector(runEnglishSRT)))
+        row1.addArrangedSubview(outlineButton("Translate EN→ZH", action: #selector(translateENToZH)))
+        row1.addArrangedSubview(outlineButton("Merge ASS+Burn",  action: #selector(mergeAndBurn)))
+
+        // Row 2: Run All — full width purple
+        let runAllBtn = NSButton(title: "", target: self, action: #selector(runAll))
+        runAllBtn.isBordered = false; runAllBtn.wantsLayer = true
+        runAllBtn.layer?.backgroundColor = NSColor(red: 0.48, green: 0.25, blue: 0.90, alpha: 1).cgColor
+        runAllBtn.layer?.cornerRadius = 8
+        runAllBtn.heightAnchor.constraint(equalToConstant: 46).isActive = true
+        let runAllAttr: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: 15, weight: .semibold), .foregroundColor: NSColor.white
+        ]
+        runAllBtn.attributedTitle = NSAttributedString(string: "▶   Run All", attributes: runAllAttr)
+
+        btnGrid.addArrangedSubview(row1)
+        btnGrid.addArrangedSubview(runAllBtn)
+        leftStack.addArrangedSubview(padded(btnGrid))
+        // Bind btnGrid and its children to full width
+        if let wrapper = leftStack.arrangedSubviews.last as? NSStackView,
+           let grid = wrapper.arrangedSubviews.first as? NSStackView {
+            wrapper.translatesAutoresizingMaskIntoConstraints = false
+            wrapper.widthAnchor.constraint(equalTo: leftStack.widthAnchor).isActive = true
+            grid.translatesAutoresizingMaskIntoConstraints = false
+            grid.widthAnchor.constraint(equalTo: wrapper.widthAnchor, constant: -32).isActive = true
+            for sub in grid.arrangedSubviews {
+                sub.translatesAutoresizingMaskIntoConstraints = false
+                sub.widthAnchor.constraint(equalTo: grid.widthAnchor).isActive = true
             }
         }
-        let raw = String(data: responseData, encoding: .utf8) ?? ""
-        throw message("Could not read text from OpenAI response: \(raw)")
+
+        // Status bar
+        let statusBar = NSStackView(); statusBar.orientation = .horizontal; statusBar.spacing = 8
+        statusBar.edgeInsets = NSEdgeInsets(top: 6, left: 16, bottom: 6, right: 16)
+        statusBar.wantsLayer = true
+        statusBar.layer?.backgroundColor = NSColor(red: 0.10, green: 0.08, blue: 0.16, alpha: 1).cgColor
+        let statusIndicator = NSTextField(labelWithString: "● Ready")
+        statusIndicator.font = .systemFont(ofSize: 13)
+        statusIndicator.textColor = NSColor(red: 0.3, green: 0.9, blue: 0.5, alpha: 1)
+        objc_setAssociatedObject(self, &AssocKeys.statusBar, statusIndicator, .OBJC_ASSOCIATION_RETAIN)
+        cancelButton.title = "Cancel"
+        cancelButton.isBordered = false; cancelButton.wantsLayer = true
+        cancelButton.layer?.backgroundColor = NSColor(red: 0.8, green: 0.2, blue: 0.2, alpha: 0.2).cgColor
+        cancelButton.layer?.cornerRadius = 6
+        cancelButton.contentTintColor = NSColor(red: 1, green: 0.4, blue: 0.4, alpha: 1)
+        cancelButton.font = .systemFont(ofSize: 13)
+        cancelButton.target = self; cancelButton.action = #selector(cancelJob)
+        cancelButton.isEnabled = false
+        cancelButton.heightAnchor.constraint(equalToConstant: 26).isActive = true
+        progressBar.style = .bar; progressBar.isIndeterminate = false
+        progressBar.minValue = 0; progressBar.maxValue = 1
+        progressBar.isHidden = true
+        statusBar.addArrangedSubview(statusIndicator)
+        statusBar.addArrangedSubview(NSView())
+        statusBar.addArrangedSubview(cancelButton)
+        leftStack.addArrangedSubview(statusBar)
+        leftStack.addArrangedSubview(spacer(8))
+
+        // ── Right panel ───────────────────────────────────────────────
+        let rightPanel = NSView()
+        rightPanel.wantsLayer = true
+        rightPanel.layer?.backgroundColor = NSColor(red: 0.06, green: 0.05, blue: 0.10, alpha: 1).cgColor
+        rightPanel.translatesAutoresizingMaskIntoConstraints = false
+
+        // Top info bar (file + status)
+        let infoBar = NSView()
+        infoBar.wantsLayer = true
+        infoBar.layer?.backgroundColor = NSColor(red: 0.10, green: 0.08, blue: 0.18, alpha: 1).cgColor
+        infoBar.translatesAutoresizingMaskIntoConstraints = false
+
+        let thumbView = NSView()
+        thumbView.wantsLayer = true
+        thumbView.layer?.backgroundColor = NSColor(red: 0.15, green: 0.12, blue: 0.22, alpha: 1).cgColor
+        thumbView.layer?.cornerRadius = 6
+        thumbView.widthAnchor.constraint(equalToConstant: 80).isActive = true
+        thumbView.heightAnchor.constraint(equalToConstant: 48).isActive = true
+        let thumbIcon = mkLabel("🎬", 20, .regular, NSColor(white: 1, alpha: 0.4))
+        thumbIcon.translatesAutoresizingMaskIntoConstraints = false
+        thumbView.addSubview(thumbIcon)
+        NSLayoutConstraint.activate([
+            thumbIcon.centerXAnchor.constraint(equalTo: thumbView.centerXAnchor),
+            thumbIcon.centerYAnchor.constraint(equalTo: thumbView.centerYAnchor),
+        ])
+
+        let fileNameLabel = mkLabel("No file selected", 15, .semibold, .white)
+        let filePathLabel = mkLabel("Drag a video file or use Add Files", 12, .regular, NSColor(white: 1, alpha: 0.4))
+        objc_setAssociatedObject(self, &AssocKeys.fileNameLabel, fileNameLabel, .OBJC_ASSOCIATION_RETAIN)
+        let fileInfo = vstack([filePathLabel, fileNameLabel], spacing: 3)
+
+        let pendingBadge = NSView()
+        pendingBadge.wantsLayer = true
+        pendingBadge.layer?.backgroundColor = NSColor(red: 0.48, green: 0.25, blue: 0.90, alpha: 0.3).cgColor
+        pendingBadge.layer?.cornerRadius = 8
+        pendingBadge.layer?.borderWidth = 1
+        pendingBadge.layer?.borderColor = NSColor(red: 0.55, green: 0.35, blue: 0.95, alpha: 0.6).cgColor
+        let pendingLabel = mkLabel("PENDING", 11, .bold, NSColor(red: 0.7, green: 0.55, blue: 1.0, alpha: 1))
+        pendingLabel.translatesAutoresizingMaskIntoConstraints = false
+        pendingBadge.addSubview(pendingLabel)
+        NSLayoutConstraint.activate([
+            pendingLabel.leadingAnchor.constraint(equalTo: pendingBadge.leadingAnchor, constant: 8),
+            pendingLabel.trailingAnchor.constraint(equalTo: pendingBadge.trailingAnchor, constant: -8),
+            pendingLabel.centerYAnchor.constraint(equalTo: pendingBadge.centerYAnchor),
+            pendingBadge.heightAnchor.constraint(equalToConstant: 22),
+        ])
+        objc_setAssociatedObject(self, &AssocKeys.pendingBadge, pendingLabel, .OBJC_ASSOCIATION_RETAIN)
+
+        let infoContent = hstack([thumbView, fileInfo, NSView(), pendingBadge], spacing: 12)
+        infoContent.translatesAutoresizingMaskIntoConstraints = false
+        infoBar.addSubview(infoContent)
+        NSLayoutConstraint.activate([
+            infoBar.heightAnchor.constraint(equalToConstant: 68),
+            infoContent.leadingAnchor.constraint(equalTo: infoBar.leadingAnchor, constant: 16),
+            infoContent.trailingAnchor.constraint(equalTo: infoBar.trailingAnchor, constant: -16),
+            infoContent.centerYAnchor.constraint(equalTo: infoBar.centerYAnchor),
+        ])
+
+        // Log header
+        let logHeader = NSView()
+        logHeader.wantsLayer = true
+        logHeader.layer?.backgroundColor = NSColor(red: 0.09, green: 0.07, blue: 0.15, alpha: 1).cgColor
+        logHeader.translatesAutoresizingMaskIntoConstraints = false
+        let logIcon = mkLabel("⬛", 13, .regular, NSColor(red: 0.55, green: 0.35, blue: 0.95, alpha: 1))
+        let logTitle = mkLabel("PROCESS LOG", 12, .bold, NSColor(white: 1, alpha: 0.5))
+        let clearLogBtn = ghostButton("Clear", action: #selector(clearLog))
+        let logHead = hstack([logIcon, logTitle, NSView(), clearLogBtn], spacing: 8)
+        logHead.translatesAutoresizingMaskIntoConstraints = false
+        logHeader.addSubview(logHead)
+        NSLayoutConstraint.activate([
+            logHeader.heightAnchor.constraint(equalToConstant: 36),
+            logHead.leadingAnchor.constraint(equalTo: logHeader.leadingAnchor, constant: 12),
+            logHead.trailingAnchor.constraint(equalTo: logHeader.trailingAnchor, constant: -12),
+            logHead.centerYAnchor.constraint(equalTo: logHeader.centerYAnchor),
+        ])
+
+        // Log view
+        logView.isEditable = false
+        logView.drawsBackground = false
+        logView.font = .monospacedSystemFont(ofSize: 13, weight: .regular)
+        logView.textColor = NSColor(red: 0.2, green: 0.9, blue: 0.5, alpha: 1)
+        logView.textContainerInset = NSSize(width: 12, height: 12)
+        let logScroll = NSScrollView()
+        logScroll.drawsBackground = false
+        logScroll.hasVerticalScroller = true
+        logScroll.documentView = logView
+        logScroll.contentView.backgroundColor = NSColor(red: 0.06, green: 0.04, blue: 0.10, alpha: 1)
+        logScroll.translatesAutoresizingMaskIntoConstraints = false
+
+        // Vertical divider between panels
+        let vDiv = NSView()
+        vDiv.wantsLayer = true
+        vDiv.layer?.backgroundColor = NSColor(red: 0.25, green: 0.18, blue: 0.38, alpha: 1).cgColor
+        vDiv.translatesAutoresizingMaskIntoConstraints = false
+
+        rightPanel.addSubview(infoBar)
+        rightPanel.addSubview(logHeader)
+        rightPanel.addSubview(logScroll)
+        NSLayoutConstraint.activate([
+            infoBar.leadingAnchor.constraint(equalTo: rightPanel.leadingAnchor),
+            infoBar.trailingAnchor.constraint(equalTo: rightPanel.trailingAnchor),
+            infoBar.topAnchor.constraint(equalTo: rightPanel.topAnchor),
+            logHeader.leadingAnchor.constraint(equalTo: rightPanel.leadingAnchor),
+            logHeader.trailingAnchor.constraint(equalTo: rightPanel.trailingAnchor),
+            logHeader.topAnchor.constraint(equalTo: infoBar.bottomAnchor),
+            logScroll.leadingAnchor.constraint(equalTo: rightPanel.leadingAnchor),
+            logScroll.trailingAnchor.constraint(equalTo: rightPanel.trailingAnchor),
+            logScroll.topAnchor.constraint(equalTo: logHeader.bottomAnchor),
+            logScroll.bottomAnchor.constraint(equalTo: rightPanel.bottomAnchor),
+        ])
+
+        // Batch queue (bottom of left panel)
+        leftStack.addArrangedSubview(purpleDivider())
+        leftStack.addArrangedSubview(spacer(4))
+        let batchTitle = mkLabel("BATCH QUEUE", 11, .bold, NSColor(white: 1, alpha: 0.4))
+        leftStack.addArrangedSubview(padded(batchTitle))
+
+        let col1 = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("file"))
+        col1.title = "File"; col1.width = 220
+        let col2 = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("status"))
+        col2.title = "Status"; col2.width = 120
+        batchTableView.addTableColumn(col1)
+        batchTableView.addTableColumn(col2)
+        batchTableView.dataSource = self; batchTableView.delegate = self
+        batchTableView.backgroundColor = NSColor(red: 0.08, green: 0.06, blue: 0.13, alpha: 1)
+        batchTableView.allowsMultipleSelection = true
+        let batchScroll2 = NSScrollView()
+        batchScroll2.drawsBackground = false
+        batchScroll2.hasVerticalScroller = true
+        batchScroll2.documentView = batchTableView
+        batchScroll2.heightAnchor.constraint(equalToConstant: 90).isActive = true
+        leftStack.addArrangedSubview(padded(batchScroll2))
+
+        let batchBtns = NSStackView(); batchBtns.orientation = .horizontal; batchBtns.spacing = 6
+        batchBtns.addArrangedSubview(ghostButton("Add Files…", action: #selector(addBatchFiles)))
+        batchBtns.addArrangedSubview(ghostButton("Remove", action: #selector(removeBatchFiles)))
+        batchBtns.addArrangedSubview(ghostButton("Run Batch", action: #selector(runBatch)))
+        batchBtns.addArrangedSubview(NSView())
+        leftStack.addArrangedSubview(padded(batchBtns))
+        leftStack.addArrangedSubview(spacer(8))
+
+        // ── Layout: left | divider | right ───────────────────────────
+        cv.addSubview(leftScroll)
+        cv.addSubview(vDiv)
+        cv.addSubview(rightPanel)
+        NSLayoutConstraint.activate([
+            leftScroll.leadingAnchor.constraint(equalTo: cv.leadingAnchor),
+            leftScroll.topAnchor.constraint(equalTo: titleDiv.bottomAnchor),
+            leftScroll.bottomAnchor.constraint(equalTo: cv.bottomAnchor),
+            leftScroll.widthAnchor.constraint(equalTo: cv.widthAnchor, multiplier: 0.40),
+            vDiv.leadingAnchor.constraint(equalTo: leftScroll.trailingAnchor),
+            vDiv.topAnchor.constraint(equalTo: titleDiv.bottomAnchor),
+            vDiv.bottomAnchor.constraint(equalTo: cv.bottomAnchor),
+            vDiv.widthAnchor.constraint(equalToConstant: 1),
+            rightPanel.leadingAnchor.constraint(equalTo: vDiv.trailingAnchor),
+            rightPanel.trailingAnchor.constraint(equalTo: cv.trailingAnchor),
+            rightPanel.topAnchor.constraint(equalTo: titleDiv.bottomAnchor),
+            rightPanel.bottomAnchor.constraint(equalTo: cv.bottomAnchor),
+        ])
+
+        // Wire up the runner
+        runner.onLog = { [weak self] msg in DispatchQueue.main.async { self?.log(msg) } }
+        runner.onProgress = { [weak self] p in DispatchQueue.main.async { self?.updateProgress(p) } }
+
+        window.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
     }
 
-    func callChatCompletions(input: String, apiKey: String, provider: String, model: String) throws -> String {
-        let baseURL: String
-        switch provider {
-        case "DeepSeek":
-            baseURL = "https://api.deepseek.com"
-        case "Kimi 2.5":
-            baseURL = "https://api.moonshot.ai/v1"
-        default:
-            throw message("Unsupported translation provider: \(provider)")
-        }
+    // MARK: - UI helpers
 
-        let body: [String: Any] = [
-            "model": model,
-            "messages": [
-                [
-                    "role": "system",
-                    "content": "You are a professional subtitle translator. Return only the requested machine-readable output."
-                ],
-                [
-                    "role": "user",
-                    "content": input
-                ]
-            ],
-            "temperature": 0.2
-        ]
-        let data = try JSONSerialization.data(withJSONObject: body)
-        var request = URLRequest(url: URL(string: "\(baseURL)/chat/completions")!)
-        request.httpMethod = "POST"
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
-        request.httpBody = data
-
-        let semaphore = DispatchSemaphore(value: 0)
-        var responseData: Data?
-        var response: URLResponse?
-        var responseError: Error?
-        URLSession.shared.dataTask(with: request) { data, urlResponse, error in
-            responseData = data
-            response = urlResponse
-            responseError = error
-            semaphore.signal()
-        }.resume()
-        semaphore.wait()
-
-        if let responseError {
-            throw responseError
-        }
-        if let http = response as? HTTPURLResponse, !(200...299).contains(http.statusCode) {
-            let detail = responseData.flatMap { String(data: $0, encoding: .utf8) } ?? "No response body."
-            throw message("\(provider) API returned HTTP \(http.statusCode): \(detail)")
-        }
-        guard let responseData else {
-            throw message("\(provider) API returned no data.")
-        }
-        guard let object = try JSONSerialization.jsonObject(with: responseData) as? [String: Any],
-              let choices = object["choices"] as? [[String: Any]],
-              let first = choices.first,
-              let message = first["message"] as? [String: Any],
-              let content = message["content"] as? String else {
-            let raw = String(data: responseData, encoding: .utf8) ?? ""
-            throw message("Could not read text from \(provider) response: \(raw)")
-        }
-        return content
+    private func mkLabel(_ text: String, _ size: CGFloat, _ weight: NSFont.Weight, _ color: NSColor) -> NSTextField {
+        let f = NSTextField(labelWithString: text)
+        f.font = .systemFont(ofSize: size, weight: weight)
+        f.textColor = color; return f
     }
 
-    func callGemini(input: String, apiKey: String, model: String) throws -> String {
-        let escapedModel = model.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? model
-        let url = URL(string: "https://generativelanguage.googleapis.com/v1beta/models/\(escapedModel):generateContent")!
-        let body: [String: Any] = [
-            "contents": [
-                [
-                    "role": "user",
-                    "parts": [
-                        [
-                            "text": """
-                            You are a professional subtitle translator. Return only the requested machine-readable output.
-
-                            \(input)
-                            """
-                        ]
-                    ]
-                ]
-            ],
-            "generationConfig": [
-                "temperature": 0.2,
-                "thinkingConfig": [
-                    "thinkingBudget": 0
-                ]
-            ]
-        ]
-        let data = try JSONSerialization.data(withJSONObject: body)
-        var request = URLRequest(url: url)
-        request.httpMethod = "POST"
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.setValue(apiKey, forHTTPHeaderField: "x-goog-api-key")
-        request.httpBody = data
-
-        let semaphore = DispatchSemaphore(value: 0)
-        var responseData: Data?
-        var response: URLResponse?
-        var responseError: Error?
-        URLSession.shared.dataTask(with: request) { data, urlResponse, error in
-            responseData = data
-            response = urlResponse
-            responseError = error
-            semaphore.signal()
-        }.resume()
-        semaphore.wait()
-
-        if let responseError {
-            throw responseError
-        }
-        if let http = response as? HTTPURLResponse, !(200...299).contains(http.statusCode) {
-            let detail = responseData.flatMap { String(data: $0, encoding: .utf8) } ?? "No response body."
-            throw message("Google Gemini API returned HTTP \(http.statusCode): \(detail)")
-        }
-        guard let responseData else {
-            throw message("Google Gemini API returned no data.")
-        }
-        guard let object = try JSONSerialization.jsonObject(with: responseData) as? [String: Any],
-              let candidates = object["candidates"] as? [[String: Any]],
-              let first = candidates.first,
-              let content = first["content"] as? [String: Any],
-              let parts = content["parts"] as? [[String: Any]] else {
-            let raw = String(data: responseData, encoding: .utf8) ?? ""
-            throw message("Could not read text from Google Gemini response: \(raw)")
-        }
-        let text = parts.compactMap { $0["text"] as? String }.joined(separator: "\n")
-        guard !text.isEmpty else {
-            let raw = String(data: responseData, encoding: .utf8) ?? ""
-            throw message("Google Gemini returned an empty text response: \(raw)")
-        }
-        return text
+    private func hstack(_ views: [NSView], spacing: CGFloat) -> NSStackView {
+        let s = NSStackView(views: views); s.orientation = .horizontal; s.spacing = spacing; return s
     }
 
-    func parseJSONStringArray(_ value: String) throws -> [String] {
-        var text = value.trimmingCharacters(in: .whitespacesAndNewlines)
-        if text.hasPrefix("```") {
-            text = text.replacingOccurrences(of: "```json", with: "")
-                .replacingOccurrences(of: "```", with: "")
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-        }
-        guard let data = text.data(using: .utf8),
-              let array = try JSONSerialization.jsonObject(with: data) as? [String] else {
-            throw message("Translation was not a JSON string array: \(value)")
-        }
-        return array
+    private func vstack(_ views: [NSView], spacing: CGFloat) -> NSStackView {
+        let s = NSStackView(views: views); s.orientation = .vertical; s.spacing = spacing
+        s.alignment = .leading; return s
     }
 
-    func parseJSONObjects(_ value: String) throws -> [[String: Any]] {
-        var text = value.trimmingCharacters(in: .whitespacesAndNewlines)
-        if text.hasPrefix("```") {
-            text = text.replacingOccurrences(of: "```json", with: "")
-                .replacingOccurrences(of: "```", with: "")
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-        }
-        guard let data = text.data(using: .utf8),
-              let array = try JSONSerialization.jsonObject(with: data) as? [[String: Any]] else {
-            throw message("Translation was not a JSON object array: \(value)")
-        }
-        return array
+    private func sectionHeader(_ title: String, icon: String) -> NSView {
+        let s = NSStackView()
+        s.orientation = .horizontal; s.spacing = 6
+        s.edgeInsets = NSEdgeInsets(top: 12, left: 16, bottom: 4, right: 16)
+        let iconL = mkLabel(icon, 14, .regular, NSColor(white: 1, alpha: 0.5))
+        let titleL = mkLabel(title, 11, .bold, NSColor(white: 1, alpha: 0.4))
+        s.addArrangedSubview(iconL); s.addArrangedSubview(titleL)
+        return s
     }
 
-    func writeASS(zh: URL, en: URL, out: URL, width: Int, height: Int) throws {
-        let zhCues = try parseSRT(zh)
-        let enCues = try parseSRT(en)
-        guard !zhCues.isEmpty else { throw message("Chinese SRT has no cues.") }
-        if zhCues.count != enCues.count {
-            log("Warning: Chinese cues=\(zhCues.count), English cues=\(enCues.count). Matching by cue order.")
-        }
-        let fontSize = max(32, Int(Double(height) * 0.047))
-        let marginV = max(55, Int(Double(height) * 0.075))
-        let outline = max(2, Int(Double(height) * 0.0025))
-        var lines = [
-            "[Script Info]",
-            "ScriptType: v4.00+",
-            "PlayResX: \(width)",
-            "PlayResY: \(height)",
-            "ScaledBorderAndShadow: yes",
-            "",
-            "[V4+ Styles]",
-            "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding",
-            "Style: Default,Heiti SC,\(fontSize),&H00FFFFFF,&H000000FF,&H00000000,&H99000000,0,0,0,0,100,100,0,0,1,\(outline),1,2,80,80,\(marginV),1",
-            "",
-            "[Events]",
-            "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text"
-        ]
-        for index in zhCues.indices {
-            let zhCue = zhCues[index]
-            let enText = index < enCues.count ? enCues[index].text : ""
-            let body = "\(assEscape(zhCue.text))\\N\\N\(assEscape(enText))"
-            lines.append("Dialogue: 0,\(srtTimeToAss(zhCue.start)),\(srtTimeToAss(zhCue.end)),Default,,0,0,0,,\(body)")
-        }
-        try lines.joined(separator: "\n").appending("\n").write(to: out, atomically: true, encoding: .utf8)
+    private func fieldRow(field: NSTextField, placeholder: String, buttonTitle: String, action: Selector) -> NSStackView {
+        field.placeholderString = placeholder
+        styleInputField(field)
+        field.heightAnchor.constraint(equalToConstant: 40).isActive = true
+        field.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        let btn = ghostButton(buttonTitle, action: action)
+        let row = NSStackView(); row.orientation = .horizontal; row.spacing = 6
+        row.addArrangedSubview(field); row.addArrangedSubview(btn)
+        return row
     }
 
-    func parseSRT(_ url: URL) throws -> [Cue] {
-        let raw = try String(contentsOf: url, encoding: .utf8)
-            .replacingOccurrences(of: "\r\n", with: "\n")
-            .replacingOccurrences(of: "\r", with: "\n")
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        if raw.isEmpty { return [] }
-        return raw.components(separatedBy: "\n\n").compactMap { block in
-            let lines = block.components(separatedBy: "\n").filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
-            guard lines.count >= 2 else { return nil }
-            let timingIndex = lines[0].contains("-->") ? 0 : 1
-            guard lines.indices.contains(timingIndex), lines[timingIndex].contains("-->") else { return nil }
-            let timing = lines[timingIndex].components(separatedBy: "-->")
-            let text = lines.dropFirst(timingIndex + 1).joined(separator: "\n")
-            return Cue(start: timing[0].trimmingCharacters(in: .whitespaces).components(separatedBy: " ")[0],
-                       end: timing[1].trimmingCharacters(in: .whitespaces).components(separatedBy: " ")[0],
-                       text: text)
+    private func padded(_ view: NSView) -> NSView {
+        let wrapper = NSStackView()
+        wrapper.orientation = .vertical
+        wrapper.edgeInsets = NSEdgeInsets(top: 0, left: 16, bottom: 6, right: 16)
+        wrapper.addArrangedSubview(view)
+        return wrapper
+    }
+
+    private func spacer(_ h: CGFloat) -> NSView {
+        let v = NSView(); v.heightAnchor.constraint(equalToConstant: h).isActive = true; return v
+    }
+
+    private func purpleDivider() -> NSView {
+        let v = NSView(); v.wantsLayer = true
+        v.layer?.backgroundColor = NSColor(red: 0.28, green: 0.18, blue: 0.45, alpha: 1).cgColor
+        v.heightAnchor.constraint(equalToConstant: 1).isActive = true
+        return v
+    }
+
+    private func hDivider() -> NSView {
+        let v = NSView(); v.wantsLayer = true
+        v.layer?.backgroundColor = NSColor(red: 0.20, green: 0.15, blue: 0.30, alpha: 1).cgColor
+        return v
+    }
+
+    private func styleInputField(_ f: NSTextField) {
+        f.wantsLayer = true
+        f.layer?.backgroundColor = NSColor(red: 0.13, green: 0.10, blue: 0.20, alpha: 1).cgColor
+        f.layer?.cornerRadius = 7
+        f.layer?.borderWidth = 1
+        f.layer?.borderColor = NSColor(red: 0.32, green: 0.22, blue: 0.50, alpha: 1).cgColor
+        f.textColor = .white; f.isBordered = false; f.drawsBackground = false; f.focusRingType = .none
+        f.font = .systemFont(ofSize: 13)
+        if let cell = f.cell as? NSTextFieldCell {
+            cell.placeholderAttributedString = NSAttributedString(
+                string: f.placeholderString ?? "",
+                attributes: [.foregroundColor: NSColor(white: 1, alpha: 0.25),
+                             .font: NSFont.systemFont(ofSize: 13)])
         }
     }
 
-    func srtTimeToAss(_ value: String) -> String {
-        let parts = value.replacingOccurrences(of: ",", with: ".").components(separatedBy: ".")
-        let hms = parts[0].split(separator: ":").map(String.init)
-        let centis = String((parts.count > 1 ? parts[1] : "00").prefix(2))
-        return "\(Int(hms[0]) ?? 0):\(hms[1]):\(hms[2]).\(centis)"
+    private func stylePopup(_ p: NSPopUpButton) {
+        p.wantsLayer = true
+        p.layer?.backgroundColor = NSColor(red: 0.13, green: 0.10, blue: 0.20, alpha: 1).cgColor
+        p.layer?.cornerRadius = 7
+        p.layer?.borderWidth = 1
+        p.layer?.borderColor = NSColor(red: 0.32, green: 0.22, blue: 0.50, alpha: 1).cgColor
+        p.heightAnchor.constraint(equalToConstant: 40).isActive = true
     }
 
-    func assEscape(_ text: String) -> String {
-        text.replacingOccurrences(of: "\\", with: "\\\\")
-            .replacingOccurrences(of: "{", with: "\\{")
-            .replacingOccurrences(of: "}", with: "\\}")
-            .replacingOccurrences(of: "\n", with: "\\N")
+    private func ghostButton(_ title: String, action: Selector) -> NSButton {
+        let b = NSButton(title: title, target: self, action: action)
+        b.isBordered = false; b.wantsLayer = true
+        b.layer?.backgroundColor = NSColor(red: 0.18, green: 0.13, blue: 0.28, alpha: 1).cgColor
+        b.layer?.cornerRadius = 7
+        b.layer?.borderWidth = 1
+        b.layer?.borderColor = NSColor(red: 0.32, green: 0.22, blue: 0.50, alpha: 1).cgColor
+        b.contentTintColor = NSColor(white: 1, alpha: 0.75)
+        b.font = .systemFont(ofSize: 13, weight: .medium)
+        b.heightAnchor.constraint(equalToConstant: 34).isActive = true
+        let w = (title as NSString).size(withAttributes: [.font: NSFont.systemFont(ofSize: 11)]).width
+        b.widthAnchor.constraint(greaterThanOrEqualToConstant: w + 20).isActive = true
+        return b
     }
 
-    func filterEscape(_ text: String) -> String {
-        text.replacingOccurrences(of: "\\", with: "\\\\")
-            .replacingOccurrences(of: ":", with: "\\:")
-            .replacingOccurrences(of: "'", with: "\\'")
-            .replacingOccurrences(of: ",", with: "\\,")
+    private func accentButton(_ title: String, action: Selector) -> NSButton {
+        let b = NSButton(title: title, target: self, action: action)
+        b.isBordered = false; b.wantsLayer = true
+        b.layer?.backgroundColor = NSColor(red: 0.48, green: 0.25, blue: 0.90, alpha: 1).cgColor
+        b.layer?.cornerRadius = 7
+        b.contentTintColor = .white
+        b.font = .systemFont(ofSize: 13, weight: .semibold)
+        b.heightAnchor.constraint(equalToConstant: 34).isActive = true
+        let w = (title as NSString).size(withAttributes: [.font: NSFont.systemFont(ofSize: 11)]).width
+        b.widthAnchor.constraint(greaterThanOrEqualToConstant: w + 20).isActive = true
+        return b
+    }
+
+    private func outlineButton(_ title: String, action: Selector) -> NSButton {
+        let b = NSButton(title: title, target: self, action: action)
+        b.isBordered = false; b.wantsLayer = true
+        b.layer?.backgroundColor = NSColor(red: 0.15, green: 0.11, blue: 0.23, alpha: 1).cgColor
+        b.layer?.cornerRadius = 7
+        b.layer?.borderWidth = 1
+        b.layer?.borderColor = NSColor(red: 0.40, green: 0.28, blue: 0.62, alpha: 1).cgColor
+        b.contentTintColor = .white
+        b.font = .systemFont(ofSize: 14, weight: .medium)
+        b.heightAnchor.constraint(equalToConstant: 42).isActive = true
+        return b
+    }
+
+    @objc func clearLog() {
+        logView.textStorage?.setAttributedString(NSAttributedString(string: ""))
+    }
+
+        // MARK: - Progress
+
+    func updateProgress(_ p: PipelineProgress) {
+        if p.fraction >= 0 {
+            progressBar.doubleValue = p.fraction
+        }
+        var label = p.step
+        if let t = p.ffmpegTime { label += "  \(t)" }
+        if let sb = objc_getAssociatedObject(self, &AssocKeys.statusBar) as? NSTextField {
+            sb.stringValue = "● " + label
+            sb.textColor = NSColor(red: 0.3, green: 0.9, blue: 0.5, alpha: 1)
+        }
+    }
+
+    // MARK: - Job management
+
+    func startJob(_ work: @escaping () async throws -> Void) {
+        guard currentTask == nil else {
+            alert("A job is already running.")
+            return
+        }
+        saveSettings()
+        cancelButton.isEnabled = true
+        progressBar.doubleValue = 0
+        if let sb = objc_getAssociatedObject(self, &AssocKeys.statusBar) as? NSTextField {
+            sb.stringValue = "● Running…"
+            sb.textColor = NSColor(red: 0.95, green: 0.75, blue: 0.2, alpha: 1)
+        }
+        currentTask = Task {
+            do {
+                try await work()
+                await MainActor.run { self.log("✅ Done.") }
+            } catch SubtitleError.cancelled {
+                await MainActor.run { self.log("⚠️ Cancelled.") }
+            } catch {
+                await MainActor.run {
+                    self.log("❌ \(error.localizedDescription)")
+                    self.alert(error.localizedDescription)
+                }
+            }
+            await MainActor.run {
+                self.currentTask = nil
+                self.cancelButton.isEnabled = false
+                self.progressBar.doubleValue = 0
+                if let sb = objc_getAssociatedObject(self, &AssocKeys.statusBar) as? NSTextField {
+                    sb.stringValue = "● Ready"
+                    sb.textColor = NSColor(red: 0.3, green: 0.9, blue: 0.5, alpha: 1)
+                }
+            }
+        }
+    }
+
+    @objc func cancelJob() {
+        runner.cancel()
+        currentTask?.cancel()
+    }
+
+    // MARK: - Actions
+
+    @objc func checkDependencies() {
+        startJob {
+            self.log("Checking dependencies…")
+            let paths = await MainActor.run { [
+                ("ffmpeg",  self.ffmpegField.stringValue),
+                ("ffprobe", self.ffprobeField.stringValue),
+                ("whisper", self.whisperField.stringValue),
+                ("Font",    self.fontField.stringValue)
+            ] }
+            for (name, path) in paths {
+                let ok = FileManager.default.fileExists(atPath: path)
+                self.log("\(name): \(ok ? "✅" : "❌ Missing")  \(path)")
+            }
+        }
+    }
+
+    @objc func runEnglishSRT() {
+        startJob {
+            self.syncRunnerPaths()
+            let source = try self.requireSource()
+            let out    = try self.requireOutputFolder()
+            let srtURL = try await self.runner.runEnglishSRT(
+                source: source,
+                outputFolder: out,
+                whisperModel: self.selectedModel()
+            )
+            await MainActor.run { self.englishField.stringValue = srtURL.path }
+        }
+    }
+
+    @objc func translateENToZH() {
+        startJob {
+            self.syncRunnerPaths()
+            let source = try self.requireSource()
+            let paths  = Paths(source: source, outputRoot: try self.requireOutputFolder())
+            let enPath = self.englishField.stringValue.isEmpty ? paths.enSRT.path : self.englishField.stringValue
+            let apiKey = self.apiKeyField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+            let provider = self.selectedProvider()
+            guard FileManager.default.fileExists(atPath: enPath) else {
+                throw SubtitleError.missingFile(enPath)
+            }
+            guard !apiKey.isEmpty else { throw SubtitleError.missingAPIKey(provider) }
+
+            let zhURL = try await self.runner.translateSRT(
+                enSRT: URL(fileURLWithPath: enPath),
+                zhSRT: paths.zhSRT,
+                provider: self.selectedProvider(),
+                model: self.translateModel(),
+                apiKey: apiKey
+            )
+            await MainActor.run { self.chineseField.stringValue = zhURL.path }
+        }
+    }
+
+    @objc func mergeAndBurn() {
+        startJob {
+            self.syncRunnerPaths()
+            let source = try self.requireSource()
+            let out    = try self.requireOutputFolder()
+            let enOverride = self.englishField.stringValue
+            let zhOverride = self.chineseField.stringValue
+            _ = try await self.runner.mergeAndBurn(
+                source: source,
+                outputFolder: out,
+                enSRTOverride: enOverride,
+                zhSRTOverride: zhOverride
+            )
+        }
+    }
+
+    @objc func runAll() {
+        startJob {
+            self.syncRunnerPaths()
+            let source = try self.requireSource()
+            let out    = try self.requireOutputFolder()
+            let apiKey = self.apiKeyField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+            let provider = self.selectedProvider()
+            let enOverride = self.englishField.stringValue
+            let zhOverride = self.chineseField.stringValue
+            let wModel = self.selectedModel()
+            guard !apiKey.isEmpty else { throw SubtitleError.missingAPIKey(provider) }
+            _ = try await self.runner.runAll(
+                source: source,
+                outputFolder: out,
+                whisperModel: wModel,
+                provider: self.selectedProvider(),
+                translateModel: self.translateModel(),
+                apiKey: apiKey,
+                enSRTOverride: enOverride,
+                zhSRTOverride: zhOverride
+            )
+        }
+    }
+
+    // MARK: - Batch
+
+    @objc func addBatchFiles() {
+        let panel = NSOpenPanel()
+        if #available(macOS 12.0, *) { panel.allowedContentTypes = [.mpeg4Movie, .quickTimeMovie] } else { panel.allowedFileTypes = ["mov", "mp4", "m4v"] }
+        panel.allowsMultipleSelection = true
+        if panel.runModal() == .OK {
+            addToBatch(urls: panel.urls)
+        }
+    }
+
+    @objc func removeBatchFiles() {
+        let selected = batchTableView.selectedRowIndexes.sorted().reversed()
+        for idx in selected { batchJobs.remove(at: idx) }
+        batchTableView.reloadData()
+    }
+
+    @objc func runBatch() {
+        guard !batchJobs.isEmpty else { alert("Add files to the batch queue first."); return }
+        let apiKey = apiKeyField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !apiKey.isEmpty else { alert("Enter an API key to run batch translation."); return }
+
+        startJob {
+            self.syncRunnerPaths()
+            let out = try self.requireOutputFolder()
+            for (i, _) in self.batchJobs.enumerated() {
+                let job = self.batchJobs[i]
+                self.batchJobs[i].status = .running(step: "Starting…")
+                self.batchTableView.reloadData()
+                do {
+                    _ = try await self.runner.runAll(
+                        source: job.sourceURL,
+                        outputFolder: out,
+                        whisperModel: self.selectedModel(),
+                        provider: self.selectedProvider(),
+                        translateModel: self.translateModel(),
+                        apiKey: apiKey,
+                        enSRTOverride: "",
+                        zhSRTOverride: ""
+                    )
+                    self.batchJobs[i].status = .done
+                    self.batchTableView.reloadData()
+                } catch SubtitleError.cancelled {
+                    self.batchJobs[i].status = .cancelled
+                    self.batchTableView.reloadData()
+                    return  // stop batch on cancel
+                } catch {
+                    self.batchJobs[i].status = .failed(error.localizedDescription)
+                    self.batchTableView.reloadData()
+                }
+            }
+        }
+    }
+
+    func addToBatch(urls: [URL]) {
+        let videoExtensions = ["mov", "mp4", "m4v"]
+        let newJobs = urls
+            .filter { videoExtensions.contains($0.pathExtension.lowercased()) }
+            .filter { url in !batchJobs.contains(where: { $0.sourceURL == url }) }
+            .map { BatchJob(sourceURL: $0) }
+        batchJobs.append(contentsOf: newJobs)
+        batchTableView.reloadData()
+        log("Added \(newJobs.count) file(s) to batch queue.")
+        if let first = newJobs.first,
+           let lbl = objc_getAssociatedObject(self, &AssocKeys.fileNameLabel) as? NSTextField {
+            lbl.stringValue = first.sourceURL.lastPathComponent
+        }
+        if let badge = objc_getAssociatedObject(self, &AssocKeys.pendingBadge) as? NSTextField {
+            badge.stringValue = batchJobs.isEmpty ? "" : "PENDING"
+        }
+    }
+
+    // MARK: - File choosers
+
+    @objc func chooseOutput() {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        if panel.runModal() == .OK, let url = panel.url {
+            outputField.stringValue = url.path
+            Settings.outputFolder = url.path
+        }
+    }
+
+    @objc func chooseEnglishSRT() { chooseFile(into: englishField, types: ["srt"]) }
+    @objc func chooseChineseSRT() { chooseFile(into: chineseField, types: ["srt"]) }
+    @objc func chooseFFmpeg()     { chooseFile(into: ffmpegField,  types: nil) }
+    @objc func chooseFFprobe()    { chooseFile(into: ffprobeField, types: nil) }
+    @objc func chooseWhisper()    { chooseFile(into: whisperField, types: nil) }
+    @objc func chooseFont() {
+        let panel = NSOpenPanel()
+        if #available(macOS 12.0, *) { panel.allowedContentTypes = [.font] } else { panel.allowedFileTypes = ["ttf", "otf", "ttc"] }
+        panel.directoryURL = URL(fileURLWithPath: "/System/Library/Fonts")
+        if panel.runModal() == .OK, let url = panel.url {
+            fontField.stringValue = url.path
+            Settings.fontPath = url.path
+        }
+    }
+
+    @objc func saveAPIKey() {
+        let key = apiKeyField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        if key.isEmpty {
+            KeychainStore.delete(for: selectedProvider())
+            log("API key cleared from Keychain.")
+        } else {
+            KeychainStore.save(key: key, for: selectedProvider())
+            log("API key saved to Keychain for \(selectedProvider()).")
+        }
+    }
+
+    @objc func defaultTranslateModel() {
+        translateModelField.stringValue = Settings.defaultModel(for: selectedProvider())
+    }
+
+    @objc func providerChanged() {
+        translateModelField.stringValue = Settings.defaultModel(for: selectedProvider())
+        // Load saved key for this provider from Keychain
+        apiKeyField.stringValue = KeychainStore.load(for: selectedProvider()) ?? ""
+        Settings.translateProvider = selectedProvider()
+    }
+
+    @objc func settingChanged() { saveSettings() }
+
+    func chooseFile(into field: NSTextField, types: [String]?) {
+        let panel = NSOpenPanel()
+        if let types {
+            panel.allowedFileTypes = types
+        }
+        if panel.runModal() == .OK, let url = panel.url {
+            field.stringValue = url.path
+        }
+    }
+
+    // MARK: - Helpers
+
+    func syncRunnerPaths() {
+        runner.ffmpegPath  = ffmpegField.stringValue
+        runner.ffprobePath = ffprobeField.stringValue
+        runner.whisperPath = whisperField.stringValue
+        runner.fontPath    = fontField.stringValue.isEmpty ? Settings.preferredSystemFont() : fontField.stringValue
+        runner.syncOffsetSeconds = Double(syncOffsetField.stringValue.trimmingCharacters(in: .whitespaces)) ?? 0.0
+    }
+
+    func requireSource() throws -> URL {
+        // Use first queued job if batch is populated and none manually set
+        if let first = batchJobs.first(where: { $0.status == .queued }) {
+            return first.sourceURL
+        }
+        // Fallback: check if there's only one job in queue
+        if let first = batchJobs.first {
+            return first.sourceURL
+        }
+        throw SubtitleError.missingSource
+    }
+
+    func requireOutputFolder() throws -> URL {
+        let path = outputField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !path.isEmpty else { throw SubtitleError.missingFile("Output folder not set.") }
+        try FileManager.default.createDirectory(atPath: path, withIntermediateDirectories: true)
+        return URL(fileURLWithPath: path)
+    }
+
+    func selectedModel() -> String {
+        modelPopup.titleOfSelectedItem ?? "turbo"
+    }
+
+    func selectedProvider() -> String {
+        providerPopup.titleOfSelectedItem ?? "OpenAI"
+    }
+
+    func translateModel() -> String {
+        let v = translateModelField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        return v.isEmpty ? Settings.defaultModel(for: selectedProvider()) : v
     }
 
     func findTool(_ name: String) -> String {
-        for dir in [appBinDir, "/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin"] {
+        for dir in ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin"] {
             let path = "\(dir)/\(name)"
-            if FileManager.default.isExecutableFile(atPath: path) {
-                return path
-            }
+            if FileManager.default.isExecutableFile(atPath: path) { return path }
         }
         return ""
     }
 
-    func prepareAppBin() {
-        do {
-            try FileManager.default.createDirectory(atPath: appBinDir, withIntermediateDirectories: true)
-            for name in ["ffmpeg", "ffprobe", "whisper"] {
-                let link = "\(appBinDir)/\(name)"
-                if FileManager.default.fileExists(atPath: link) {
-                    continue
-                }
-                for dir in ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin"] {
-                    let target = "\(dir)/\(name)"
-                    if FileManager.default.isExecutableFile(atPath: target) {
-                        try? FileManager.default.createSymbolicLink(atPath: link, withDestinationPath: target)
-                        break
-                    }
-                }
-            }
-        } catch {
-            NSLog("Could not prepare app bin directory: \(error.localizedDescription)")
-        }
-    }
-
     func log(_ value: String) {
         DispatchQueue.main.async {
-            self.logView.textStorage?.append(NSAttributedString(string: value + "\n"))
-            self.logView.scrollToEndOfDocument(nil)
-        }
-    }
-
-    func text(_ field: NSTextField) -> String {
-        if Thread.isMainThread {
-            return field.stringValue
-        }
-        return DispatchQueue.main.sync {
-            field.stringValue
-        }
-    }
-
-    func setText(_ field: NSTextField, _ value: String) {
-        if Thread.isMainThread {
-            field.stringValue = value
-        } else {
-            DispatchQueue.main.sync {
-                field.stringValue = value
+            let color: NSColor
+            if value.contains("❌") || value.lowercased().contains("error") {
+                color = NSColor(red: 1.0, green: 0.35, blue: 0.35, alpha: 1)
+            } else if value.contains("✅") || value.lowercased().contains("done") {
+                color = NSColor(red: 0.3, green: 0.9, blue: 0.5, alpha: 1)
+            } else if value.contains("⚠️") {
+                color = NSColor(red: 0.95, green: 0.75, blue: 0.2, alpha: 1)
+            } else if value.contains("Translating") || value.contains("chunk") {
+                color = NSColor(red: 0.55, green: 0.75, blue: 1.0, alpha: 1)
+            } else {
+                color = NSColor(red: 0.2, green: 0.85, blue: 0.5, alpha: 1)
             }
-        }
-    }
-
-    func selectedModel() -> String {
-        if Thread.isMainThread {
-            return modelPopup.titleOfSelectedItem ?? "turbo"
-        }
-        return DispatchQueue.main.sync {
-            self.modelPopup.titleOfSelectedItem ?? "turbo"
-        }
-    }
-
-    func selectedProvider() -> String {
-        if Thread.isMainThread {
-            return providerPopup.titleOfSelectedItem ?? "OpenAI"
-        }
-        return DispatchQueue.main.sync {
-            self.providerPopup.titleOfSelectedItem ?? "OpenAI"
-        }
-    }
-
-    func translateModel() -> String {
-        let value = text(translateModelField).trimmingCharacters(in: .whitespacesAndNewlines)
-        return value.isEmpty ? defaultModel(for: selectedProvider()) : value
-    }
-
-    func defaultModel(for provider: String) -> String {
-        switch provider {
-        case "DeepSeek":
-            return "deepseek-v4-flash"
-        case "Kimi 2.5":
-            return "kimi-k2.5"
-        case "Google Gemini":
-            return "gemini-2.5-flash"
-        default:
-            return "gpt-4.1-mini"
+            let ts = { () -> String in
+                let f = DateFormatter(); f.dateFormat = "HH:mm:ss"
+                return f.string(from: Date())
+            }()
+            let line = "[\(ts)] \(value)"
+            let attrs: [NSAttributedString.Key: Any] = [
+                .font: NSFont.monospacedSystemFont(ofSize: 13, weight: .regular),
+                .foregroundColor: color
+            ]
+            self.logView.textStorage?.append(NSAttributedString(string: line + "\n", attributes: attrs))
+            self.logView.scrollToEndOfDocument(nil)
         }
     }
 
     func alert(_ value: String) {
         DispatchQueue.main.async {
-            let alert = NSAlert()
-            alert.messageText = "Subtitle Burner"
-            alert.informativeText = value
-            alert.runModal()
+            let a = NSAlert()
+            a.messageText = "Subtitle Burner"
+            a.informativeText = value
+            a.runModal()
         }
     }
 
-    func message(_ value: String) -> NSError {
-        NSError(domain: "SubtitleBurner", code: 1, userInfo: [NSLocalizedDescriptionKey: value])
+    // MARK: - UI factory
+
+// UI helpers moved to mkLabel/ghostButton/accentButton etc.
+}
+
+// MARK: - NSTableViewDataSource / Delegate (batch queue)
+
+extension AppDelegate: NSDraggingDestination {
+    func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation { .copy }
+    func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
+        guard let items = sender.draggingPasteboard.readObjects(forClasses: [NSURL.self]) as? [URL] else { return false }
+        addToBatch(urls: items)
+        return true
     }
 }
 
+extension AppDelegate: NSTableViewDataSource, NSTableViewDelegate {
+
+    func numberOfRows(in tableView: NSTableView) -> Int { batchJobs.count }
+
+    func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
+        let job = batchJobs[row]
+        let cell = NSTextField(labelWithString: "")
+        cell.lineBreakMode = .byTruncatingMiddle
+        if tableColumn?.identifier.rawValue == "file" {
+            cell.stringValue = job.sourceURL.lastPathComponent
+        } else {
+            switch job.status {
+            case .queued:               cell.stringValue = "Queued"
+            case .running(let step):    cell.stringValue = "⏳ \(step)"
+            case .done:                 cell.stringValue = "✅ Done"
+            case .failed(let msg):      cell.stringValue = "❌ \(msg)"
+            case .cancelled:            cell.stringValue = "⚠️ Cancelled"
+            }
+        }
+        return cell
+    }
+}
+
+// MARK: - Drag-and-drop (handled via NSWindow contentView registration above)
+// AppDelegate handles drag via NSDraggingDestination on the scroll view
+
+// MARK: - AssocKeys
+private enum AssocKeys {
+    static var statusDot:     UInt8 = 0
+    static var statusText:    UInt8 = 1
+    static var statusBar:     UInt8 = 2
+    static var fileNameLabel: UInt8 = 3
+    static var pendingBadge:  UInt8 = 4
+}
+
+// MARK: - Entry point
+
 let app = NSApplication.shared
-let delegate = AppDelegate()
-app.delegate = delegate
 app.setActivationPolicy(.regular)
+MainActor.assumeIsolated {
+    let delegate = AppDelegate()
+    app.delegate = delegate
+}
 app.run()

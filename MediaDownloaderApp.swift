@@ -183,42 +183,36 @@ final class PrimaryButton: NSButton {
             let iTop    = midY + iconH / 2   // top of icon box
 
             NSColor.white.setStroke()
-            NSColor.white.setFill()
 
-            // 1. Arrow shaft: from near top down to ~40% from bottom
-            let shaftTop    = iTop - 2
-            let shaftBottom = iBottom + iconH * 0.38
-            let shaft = NSBezierPath()
-            shaft.lineWidth = 2
-            shaft.lineCapStyle = .round
-            shaft.move(to: NSPoint(x: iCX, y: shaftTop))
-            shaft.line(to: NSPoint(x: iCX, y: shaftBottom))
-            shaft.stroke()
+            // NSView coordinate system: Y=0 is BOTTOM, Y increases UPWARD
+            // So to draw arrow pointing DOWN: tip has SMALLER Y than wings
+            // iTop = highest Y (top of icon box, top of screen)
+            // iBottom = lowest Y (bottom of icon box, bottom of screen)
+            let iconMidY = (iTop + iBottom) / 2
 
-            // 2. Arrowhead: V pointing DOWN (in NSView coords, lower Y = lower on screen)
-            let arrowTip  = iBottom + iconH * 0.20   // tip points downward
-            let arrowWing = shaftBottom + 2
-            let arrow = NSBezierPath()
-            arrow.lineWidth = 2
-            arrow.lineCapStyle = .round
-            arrow.lineJoinStyle = .round
-            arrow.move(to: NSPoint(x: iCX - 6, y: arrowWing))
-            arrow.line(to: NSPoint(x: iCX,     y: arrowTip))
-            arrow.line(to: NSPoint(x: iCX + 6, y: arrowWing))
-            arrow.stroke()
+            // Shaft from iTop down to iconMidY
+            let s = NSBezierPath()
+            s.lineWidth = 2.5; s.lineCapStyle = .round
+            s.move(to: NSPoint(x: iCX, y: iTop))
+            s.line(to: NSPoint(x: iCX, y: iconMidY))
+            s.stroke()
 
-            // 3. Tray: U-shape at bottom — left cap | flat bottom | right cap
-            let trayY     = iBottom               // flat bottom of tray
-            let trayCapH: CGFloat = 5             // height of side caps
-            let tray = NSBezierPath()
-            tray.lineWidth = 2
-            tray.lineCapStyle = .round
-            tray.lineJoinStyle = .round
-            tray.move(to: NSPoint(x: ix,          y: trayY + trayCapH))   // left cap top
-            tray.line(to: NSPoint(x: ix,          y: trayY))              // left cap bottom
-            tray.line(to: NSPoint(x: ix + iconW,  y: trayY))              // bottom across
-            tray.line(to: NSPoint(x: ix + iconW,  y: trayY + trayCapH))   // right cap top
-            tray.stroke()
+            // Arrowhead: wings at iconMidY, tip at iconMidY-7 (lower = downward on screen)
+            let h = NSBezierPath()
+            h.lineWidth = 2.5; h.lineCapStyle = .round; h.lineJoinStyle = .round
+            h.move(to: NSPoint(x: iCX - 7, y: iconMidY))
+            h.line(to: NSPoint(x: iCX,     y: iconMidY - 7))
+            h.line(to: NSPoint(x: iCX + 7, y: iconMidY))
+            h.stroke()
+
+            // Tray at iBottom
+            let t = NSBezierPath()
+            t.lineWidth = 2.5; t.lineCapStyle = .round; t.lineJoinStyle = .round
+            t.move(to: NSPoint(x: ix,         y: iBottom + 6))
+            t.line(to: NSPoint(x: ix,         y: iBottom))
+            t.line(to: NSPoint(x: ix + iconW, y: iBottom))
+            t.line(to: NSPoint(x: ix + iconW, y: iBottom + 6))
+            t.stroke()
         }
     }
 }
