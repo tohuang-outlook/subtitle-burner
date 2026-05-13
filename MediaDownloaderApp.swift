@@ -246,7 +246,9 @@ final class MediaDownloaderDelegate: NSObject, NSApplicationDelegate {
     var downloadPills:  [PillToggle]   = []
     var convertPills:   [PillToggle]   = []
     var customWidthField = NSTextField()
+    var customWidthGroup = NSStackView()
     var igIndexesField  = NSTextField()
+    var igIndexesGroup  = NSStackView()
     var cookiesPopup    = NSPopUpButton()
     var ytdlpField      = NSTextField()
     var galleryDLField  = NSTextField()
@@ -260,6 +262,7 @@ final class MediaDownloaderDelegate: NSObject, NSApplicationDelegate {
     var statusDot       = NSTextField(labelWithString: "●")
     var statusLabel     = NSTextField(labelWithString: "Idle")
     var outputFileLabel = NSTextField(labelWithString: "—")
+    var outputSectionLabel = NSTextField(labelWithString: "No recent output yet")
     var elapsedLabel    = NSTextField(labelWithString: "")
     var progressBar     = NSProgressIndicator()
 
@@ -270,6 +273,7 @@ final class MediaDownloaderDelegate: NSObject, NSApplicationDelegate {
     // State
     var running         = false
     var activeProcess:  Process?
+    var lastOutputURL:  URL?
     var urlHistory:     [String] = []
     var selectedFormat  = 0
     var selectedDLSize  = 0
@@ -279,11 +283,11 @@ final class MediaDownloaderDelegate: NSObject, NSApplicationDelegate {
 
     let formatDefs  = [("🎬","YT Video"),("🎵","YT Audio"),("📹","IG Video"),("🖼","IG Photo")]
     let sizeDefs    = ["Best","1080p","720p","480p","360p"]
-    let convertDefs = ["No conversion","1080p","720p","480p","360p"]
+    let convertDefs = ["No conversion","1080p","720p","480p","360p","Custom width"]
 
     // MARK: - Lifecycle
 
-    func applicationDidFinishLaunching(_ n: Notification) { buildUI(); restorePrefs() }
+    func applicationDidFinishLaunching(_ n: Notification) { buildUI(); restorePrefs(); refreshUIState() }
     func applicationShouldTerminateAfterLastWindowClosed(_ s: NSApplication) -> Bool { true }
 
     // MARK: - Build UI
@@ -327,16 +331,10 @@ final class MediaDownloaderDelegate: NSObject, NSApplicationDelegate {
         elapsedLabel.textColor = .wsSubtext
         elapsedLabel.stringValue = "00:00"
 
-        let outputIcon = label("📁", size: 10, color: .wsSubtext)
-        outputFileLabel.font = .monospacedSystemFont(ofSize: 15, weight: .regular)
-        outputFileLabel.textColor = .wsSubtext
-        outputFileLabel.lineBreakMode = .byTruncatingMiddle
-
         let leftTitle = hstack(spacing: 8, views: [appIcon, appTitle, appSub])
         let rightStatus = hstack(spacing: 12, views: [
             hstack(spacing: 4, views: [statusDot, statusLabel]),
-            hstack(spacing: 4, views: [elapsedIcon, elapsedLabel]),
-            hstack(spacing: 4, views: [outputIcon, outputFileLabel])
+            hstack(spacing: 4, views: [elapsedIcon, elapsedLabel])
         ])
 
         leftTitle.translatesAutoresizingMaskIntoConstraints = false
@@ -466,24 +464,26 @@ final class MediaDownloaderDelegate: NSObject, NSApplicationDelegate {
         // ── Advanced section ─────────────────────────────────────────
         stack.addArrangedSubview(sectionTitle("ADVANCED OPTIONS"))
 
-        let advGrid = NSStackView(); advGrid.orientation = .horizontal; advGrid.spacing = 10
+        let advGrid = NSStackView(); advGrid.orientation = .vertical; advGrid.spacing = 10
+        advGrid.alignment = .leading
 
         // Custom width
-        let cwGroup = vstack(spacing: 4, views: [microLabel("Custom Width"), customWidthField])
+        customWidthGroup = vstack(spacing: 4, views: [microLabel("Custom Width"), customWidthField])
         customWidthField.placeholderString = "e.g. 1280"
         styleField(customWidthField)
         customWidthField.heightAnchor.constraint(equalToConstant: 42).isActive = true
-        advGrid.addArrangedSubview(cwGroup)
+        advGrid.addArrangedSubview(customWidthGroup)
 
         // IG indexes
         let listBtn = toolButton("List", #selector(listIGIndexes))
-        let igRow2  = hstack(spacing: 6, views: [igIndexesField, listBtn])
+        listBtn.widthAnchor.constraint(equalToConstant: 54).isActive = true
+        let igRow2  = fillRow([igIndexesField, listBtn])
         igIndexesField.placeholderString = "all, 1, 2-5"
         igIndexesField.stringValue = "all"
         styleField(igIndexesField)
         igIndexesField.heightAnchor.constraint(equalToConstant: 42).isActive = true
-        let igGroup = vstack(spacing: 4, views: [microLabel("IG Indexes"), igRow2])
-        advGrid.addArrangedSubview(igGroup)
+        igIndexesGroup = vstack(spacing: 4, views: [microLabel("IG Indexes"), igRow2])
+        advGrid.addArrangedSubview(igIndexesGroup)
 
         stack.addArrangedSubview(advGrid)
 
@@ -564,6 +564,25 @@ final class MediaDownloaderDelegate: NSObject, NSApplicationDelegate {
         actionStack.addArrangedSubview(cancelBtn)
         actionStack.addArrangedSubview(progressBar)
         stack.addArrangedSubview(actionStack)
+
+        stack.addArrangedSubview(divider())
+
+        outputFileLabel.font = .monospacedSystemFont(ofSize: 13, weight: .regular)
+        outputFileLabel.textColor = .wsText
+        outputFileLabel.lineBreakMode = .byTruncatingMiddle
+        outputSectionLabel.font = .systemFont(ofSize: 12)
+        outputSectionLabel.textColor = .wsSubtext
+        outputSectionLabel.lineBreakMode = .byTruncatingTail
+
+        let latestOutput = NSStackView()
+        latestOutput.orientation = .vertical
+        latestOutput.spacing = 4
+        latestOutput.alignment = .leading
+        latestOutput.addArrangedSubview(sectionTitle("LATEST OUTPUT"))
+        latestOutput.addArrangedSubview(outputFileLabel)
+        latestOutput.addArrangedSubview(outputSectionLabel)
+        stack.addArrangedSubview(latestOutput)
+
         // Force actionStack and downloadBtn to fill full width
         actionStack.translatesAutoresizingMaskIntoConstraints = false
         actionStack.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -32).isActive = true
@@ -762,13 +781,31 @@ final class MediaDownloaderDelegate: NSObject, NSApplicationDelegate {
     // MARK: - Format / size selection
 
     @objc func formatTapped(_ s: AccentTile) { selectFormat(s.tag) }
-    func selectFormat(_ i: Int) { selectedFormat = i; formatTiles.forEach { $0.isSelected = $0.tag == i } }
+    func selectFormat(_ i: Int) {
+        selectedFormat = i
+        formatTiles.forEach { $0.isSelected = $0.tag == i }
+        refreshUIState()
+    }
 
     @objc func dlSizeTapped(_ s: PillToggle) { selectDLSize(s.tag) }
     func selectDLSize(_ i: Int) { selectedDLSize = i; downloadPills.forEach { $0.isSelected = $0.tag == i } }
 
     @objc func cvSizeTapped(_ s: PillToggle) { selectCVSize(s.tag) }
-    func selectCVSize(_ i: Int) { selectedCvSize = i; convertPills.forEach { $0.isSelected = $0.tag == i } }
+    func selectCVSize(_ i: Int) {
+        selectedCvSize = i
+        convertPills.forEach { $0.isSelected = $0.tag == i }
+        refreshUIState()
+    }
+
+    func refreshUIState() {
+        let mode = formatDefs[selectedFormat].1
+        let isIGMode = mode.hasPrefix("IG")
+        let showCustomWidth = convertDefs[selectedCvSize] == "Custom width" && mode != "YT Audio"
+        DispatchQueue.main.async {
+            self.igIndexesGroup.isHidden = !isIGMode
+            self.customWidthGroup.isHidden = !showCustomWidth
+        }
+    }
 
     // MARK: - Actions
 
@@ -867,6 +904,7 @@ final class MediaDownloaderDelegate: NSObject, NSApplicationDelegate {
            let i = sizeDefs.firstIndex(of: ds) { selectDLSize(i) }
         if let cs = d.string(forKey: Prefs.convertSize),
            let i = convertDefs.firstIndex(of: cs) { selectCVSize(i) }
+        refreshUIState()
     }
 
     func savePrefs() {
@@ -929,7 +967,11 @@ final class MediaDownloaderDelegate: NSObject, NSApplicationDelegate {
 
     func showOutput(_ url: URL) {
         log("📁  \(url.path)")
-        DispatchQueue.main.async { self.outputFileLabel.stringValue = url.lastPathComponent }
+        lastOutputURL = url
+        DispatchQueue.main.async {
+            self.outputFileLabel.stringValue = url.lastPathComponent
+            self.outputSectionLabel.stringValue = url.deletingLastPathComponent().path
+        }
     }
 
     func performIGDownload(sourceURL: String, outputDir: URL, mode: String) throws -> [URL] {
@@ -980,6 +1022,12 @@ final class MediaDownloaderDelegate: NSObject, NSApplicationDelegate {
         case "720p":  scale = "scale=-2:720";  suffix = "720p"
         case "480p":  scale = "scale=-2:480";  suffix = "480p"
         case "360p":  scale = "scale=-2:360";  suffix = "360p"
+        case "Custom width":
+            let widthText = customWidthField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard let width = Int(widthText), width > 0 else {
+                throw message("Enter a positive custom width, for example 1280.")
+            }
+            scale = "scale=\(width):-2"; suffix = "w\(width)"
         default: return input
         }
         let out = input.deletingLastPathComponent()
