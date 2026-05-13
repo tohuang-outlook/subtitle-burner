@@ -1184,6 +1184,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     var window: NSWindow!
 
     // MARK: UI fields
+    let sourceField          = NSTextField()
     let outputField          = NSTextField()
     let englishField         = NSTextField()
     let chineseField         = NSTextField()
@@ -1200,6 +1201,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     let syncOffsetField      = NSTextField()   // e.g. "-0.5" to shift back 0.5s
     let cancelButton         = NSButton()
     let logView              = NSTextView()
+    let advancedStack        = NSStackView()
+    let advancedChevron      = NSTextField(labelWithString: "›")
+    var advancedExpanded     = false
 
     // Batch table
     let batchTableView       = NSTableView()
@@ -1222,6 +1226,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: - Settings persistence
 
     func restoreSettings() {
+        sourceField.stringValue         = ""
         outputField.stringValue         = Settings.outputFolder
         ffmpegField.stringValue         = Settings.ffmpegPath.isEmpty   ? findTool("ffmpeg")   : Settings.ffmpegPath
         ffprobeField.stringValue        = Settings.ffprobePath.isEmpty  ? findTool("ffprobe")  : Settings.ffprobePath
@@ -1349,38 +1354,39 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             leftStack.widthAnchor.constraint(equalTo: leftScroll.contentView.widthAnchor)
         ])
 
-        // Source Video section
-        leftStack.addArrangedSubview(sectionHeader("SOURCE VIDEO", icon: "🎬"))
-        let sourceRow = fieldRow(field: outputField, placeholder: "/Users/…/video.mp4",
-                                  buttonTitle: "Choose", action: #selector(chooseOutput))
+        // Video
+        leftStack.addArrangedSubview(sectionHeader("VIDEO", icon: "🎬"))
+        let sourceRow = fieldRow(field: sourceField, placeholder: "/Users/…/video.mp4",
+                                  buttonTitle: "Choose", action: #selector(chooseSource))
         leftStack.addArrangedSubview(padded(sourceRow))
-
-        leftStack.addArrangedSubview(sectionHeader("OUTPUT FOLDER", icon: "📁"))
         leftStack.addArrangedSubview(padded(fieldRow(field: outputField, placeholder: "~/Downloads",
                                                       buttonTitle: "Choose", action: #selector(chooseOutput))))
 
-        leftStack.addArrangedSubview(spacer(12))
+        leftStack.addArrangedSubview(spacer(8))
+        leftStack.addArrangedSubview(purpleDivider())
+        leftStack.addArrangedSubview(spacer(8))
 
-        leftStack.addArrangedSubview(sectionHeader("ENGLISH .SRT (AUTO-GENERATED)", icon: "📄"))
-        leftStack.addArrangedSubview(padded(fieldRow(field: englishField, placeholder: "Auto-generated after processing",
+        // Subtitles
+        leftStack.addArrangedSubview(sectionHeader("SUBTITLES", icon: "📄"))
+        leftStack.addArrangedSubview(padded(fieldRow(field: englishField, placeholder: "English .srt auto-generated after processing",
                                                       buttonTitle: "Browse", action: #selector(chooseEnglishSRT))))
-
-        leftStack.addArrangedSubview(sectionHeader("CHINESE .SRT", icon: "📄"))
-        leftStack.addArrangedSubview(padded(fieldRow(field: chineseField, placeholder: "Leave empty to auto-generate",
+        leftStack.addArrangedSubview(padded(fieldRow(field: chineseField, placeholder: "Chinese .srt, or leave empty to auto-generate",
                                                       buttonTitle: "Browse", action: #selector(chooseChineseSRT))))
 
         leftStack.addArrangedSubview(spacer(8))
         leftStack.addArrangedSubview(purpleDivider())
         leftStack.addArrangedSubview(spacer(8))
 
-        leftStack.addArrangedSubview(sectionHeader("TRANSLATE MODE", icon: "🌐"))
+        // Translation
+        leftStack.addArrangedSubview(sectionHeader("TRANSLATION", icon: "🌐"))
+        leftStack.addArrangedSubview(padded(mkLabel("Provider", 12, .regular, NSColor(white: 1, alpha: 0.45))))
         providerPopup.removeAllItems()
         providerPopup.addItems(withTitles: ["OpenAI", "DeepSeek", "Kimi 2.5", "Google Gemini"])
         providerPopup.target = self; providerPopup.action = #selector(providerChanged)
         stylePopup(providerPopup)
         leftStack.addArrangedSubview(padded(providerPopup))
 
-        leftStack.addArrangedSubview(sectionHeader("API KEY", icon: "🔑"))
+        leftStack.addArrangedSubview(padded(mkLabel("API Key", 12, .regular, NSColor(white: 1, alpha: 0.45))))
         let apiRow = NSStackView(); apiRow.orientation = .horizontal; apiRow.spacing = 6
         styleInputField(apiKeyField)
         apiKeyField.heightAnchor.constraint(equalToConstant: 40).isActive = true
@@ -1388,7 +1394,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         apiRow.addArrangedSubview(apiKeyField); apiRow.addArrangedSubview(saveKeyBtn)
         leftStack.addArrangedSubview(padded(apiRow))
 
-        leftStack.addArrangedSubview(sectionHeader("MODEL", icon: "🤖"))
+        leftStack.addArrangedSubview(padded(mkLabel("Translation Model", 12, .regular, NSColor(white: 1, alpha: 0.45))))
         let modelRow2 = NSStackView(); modelRow2.orientation = .horizontal; modelRow2.spacing = 6
         styleInputField(translateModelField)
         translateModelField.heightAnchor.constraint(equalToConstant: 40).isActive = true
@@ -1400,8 +1406,77 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         leftStack.addArrangedSubview(purpleDivider())
         leftStack.addArrangedSubview(spacer(8))
 
-        // Tools (collapsible)
-        leftStack.addArrangedSubview(sectionHeader("TOOLS", icon: "⚙️"))
+        // Output
+        leftStack.addArrangedSubview(sectionHeader("OUTPUT", icon: "🔥"))
+        let runAllBtn = NSButton(title: "", target: self, action: #selector(runAll))
+        runAllBtn.isBordered = false; runAllBtn.wantsLayer = true
+        runAllBtn.layer?.backgroundColor = NSColor(red: 0.48, green: 0.25, blue: 0.90, alpha: 1).cgColor
+        runAllBtn.layer?.cornerRadius = 8
+        runAllBtn.heightAnchor.constraint(equalToConstant: 46).isActive = true
+        let runAllAttr: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: 15, weight: .semibold), .foregroundColor: NSColor.white
+        ]
+        runAllBtn.attributedTitle = NSAttributedString(string: "▶   Run All", attributes: runAllAttr)
+        let runAllWrapper = padded(runAllBtn)
+        leftStack.addArrangedSubview(runAllWrapper)
+
+        let row1 = NSStackView(); row1.orientation = .horizontal; row1.spacing = 6
+        row1.distribution = .fillEqually
+        row1.addArrangedSubview(outlineButton("English SRT",     action: #selector(runEnglishSRT)))
+        row1.addArrangedSubview(outlineButton("Translate EN→ZH", action: #selector(translateENToZH)))
+        row1.addArrangedSubview(outlineButton("Merge ASS+Burn",  action: #selector(mergeAndBurn)))
+        let stepWrapper = padded(row1)
+        leftStack.addArrangedSubview(stepWrapper)
+        runAllWrapper.translatesAutoresizingMaskIntoConstraints = false
+        runAllWrapper.widthAnchor.constraint(equalTo: leftStack.widthAnchor).isActive = true
+        runAllBtn.translatesAutoresizingMaskIntoConstraints = false
+        runAllBtn.widthAnchor.constraint(equalTo: runAllWrapper.widthAnchor, constant: -32).isActive = true
+        stepWrapper.translatesAutoresizingMaskIntoConstraints = false
+        stepWrapper.widthAnchor.constraint(equalTo: leftStack.widthAnchor).isActive = true
+        row1.translatesAutoresizingMaskIntoConstraints = false
+        row1.widthAnchor.constraint(equalTo: stepWrapper.widthAnchor, constant: -32).isActive = true
+
+        leftStack.addArrangedSubview(spacer(8))
+        leftStack.addArrangedSubview(purpleDivider())
+        leftStack.addArrangedSubview(spacer(8))
+
+        // Advanced (collapsible)
+        let advancedToggle = NSButton(title: "", target: self, action: #selector(toggleAdvanced))
+        advancedToggle.isBordered = false
+        let advancedHeader = NSStackView(); advancedHeader.orientation = .horizontal; advancedHeader.spacing = 6
+        advancedChevron.font = .systemFont(ofSize: 15); advancedChevron.textColor = NSColor(white: 1, alpha: 0.45)
+        advancedHeader.addArrangedSubview(advancedChevron)
+        advancedHeader.addArrangedSubview(mkLabel("ADVANCED", 11, .bold, NSColor(white: 1, alpha: 0.4)))
+        advancedHeader.addArrangedSubview(NSView())
+        let advancedClickRow = NSView()
+        advancedClickRow.translatesAutoresizingMaskIntoConstraints = false
+        advancedHeader.translatesAutoresizingMaskIntoConstraints = false
+        advancedClickRow.addSubview(advancedHeader)
+        pin(advancedHeader, to: advancedClickRow)
+        advancedToggle.translatesAutoresizingMaskIntoConstraints = false
+        advancedClickRow.addSubview(advancedToggle)
+        pin(advancedToggle, to: advancedClickRow)
+        leftStack.addArrangedSubview(padded(advancedClickRow))
+
+        advancedStack.orientation = .vertical
+        advancedStack.spacing = 8
+        advancedStack.alignment = .leading
+        advancedStack.isHidden = true
+
+        advancedStack.addArrangedSubview(padded(mkLabel("Whisper Model", 12, .regular, NSColor(white: 1, alpha: 0.45))))
+        modelPopup.removeAllItems()
+        modelPopup.addItems(withTitles: ["turbo", "small", "medium", "large-v3"])
+        stylePopup(modelPopup)
+        advancedStack.addArrangedSubview(padded(modelPopup))
+
+        advancedStack.addArrangedSubview(padded(mkLabel("Sync Offset (seconds)", 12, .regular, NSColor(white: 1, alpha: 0.45))))
+        syncOffsetField.placeholderString = "0.0  (e.g. -0.5 to shift earlier)"
+        syncOffsetField.stringValue = "0.0"
+        styleInputField(syncOffsetField)
+        syncOffsetField.heightAnchor.constraint(equalToConstant: 36).isActive = true
+        advancedStack.addArrangedSubview(padded(syncOffsetField))
+
+        advancedStack.addArrangedSubview(padded(mkLabel("Tools", 12, .regular, NSColor(white: 1, alpha: 0.45))))
         for (lbl, field, sel) in [
             ("ffmpeg",   ffmpegField,  #selector(chooseFFmpeg)),
             ("ffprobe",  ffprobeField, #selector(chooseFFprobe)),
@@ -1420,75 +1495,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let lbl2 = mkLabel(lbl, 12, .regular, NSColor(white: 1, alpha: 0.4))
             let col = NSStackView(); col.orientation = .vertical; col.spacing = 3; col.alignment = .leading
             col.addArrangedSubview(lbl2); col.addArrangedSubview(toolRow)
-            // Bind col and toolRow to full panel width
             col.translatesAutoresizingMaskIntoConstraints = false
             toolRow.translatesAutoresizingMaskIntoConstraints = false
-            leftStack.addArrangedSubview(padded(col))
+            advancedStack.addArrangedSubview(padded(col))
         }
-        // After adding tool rows, bind their widths to leftStack
-        for sub in leftStack.arrangedSubviews.suffix(4) {
+        let advancedWrapper = padded(advancedStack)
+        leftStack.addArrangedSubview(advancedWrapper)
+        advancedWrapper.translatesAutoresizingMaskIntoConstraints = false
+        advancedWrapper.widthAnchor.constraint(equalTo: leftStack.widthAnchor).isActive = true
+        advancedStack.translatesAutoresizingMaskIntoConstraints = false
+        advancedStack.widthAnchor.constraint(equalTo: advancedWrapper.widthAnchor, constant: -32).isActive = true
+        for sub in advancedStack.arrangedSubviews {
             sub.translatesAutoresizingMaskIntoConstraints = false
-            sub.widthAnchor.constraint(equalTo: leftStack.widthAnchor).isActive = true
-            if let wrapper = sub as? NSStackView, let col = wrapper.arrangedSubviews.first as? NSStackView {
-                col.widthAnchor.constraint(equalTo: wrapper.widthAnchor, constant: -32).isActive = true
-                if let toolRow = col.arrangedSubviews.last as? NSStackView {
+            sub.widthAnchor.constraint(equalTo: advancedStack.widthAnchor).isActive = true
+            if let wrapper = sub as? NSStackView,
+               let content = wrapper.arrangedSubviews.first {
+                content.translatesAutoresizingMaskIntoConstraints = false
+                content.widthAnchor.constraint(equalTo: wrapper.widthAnchor, constant: -32).isActive = true
+                if let col = content as? NSStackView,
+                   let toolRow = col.arrangedSubviews.last as? NSStackView {
+                    toolRow.translatesAutoresizingMaskIntoConstraints = false
                     toolRow.widthAnchor.constraint(equalTo: col.widthAnchor).isActive = true
                 }
             }
         }
 
-        // Whisper model
-        leftStack.addArrangedSubview(sectionHeader("WHISPER MODEL", icon: "🎙"))
-        modelPopup.removeAllItems()
-        modelPopup.addItems(withTitles: ["turbo", "small", "medium", "large-v3"])
-        stylePopup(modelPopup)
-        leftStack.addArrangedSubview(padded(modelPopup))
-
-        leftStack.addArrangedSubview(sectionHeader("SYNC OFFSET (seconds)", icon: "⏱"))
-        syncOffsetField.placeholderString = "0.0  (e.g. -0.5 to shift earlier)"
-        syncOffsetField.stringValue = "0.0"
-        styleInputField(syncOffsetField)
-        syncOffsetField.heightAnchor.constraint(equalToConstant: 36).isActive = true
-        leftStack.addArrangedSubview(padded(syncOffsetField))
-
-        leftStack.addArrangedSubview(spacer(16))
-
-        // ── Action buttons ────────────────────────────────────────────
-        let btnGrid = NSStackView(); btnGrid.orientation = .vertical; btnGrid.spacing = 8
-
-        // Row 1: English SRT | Translate EN→ZH | Merge ASS+Burn  (equal width, one line)
-        let row1 = NSStackView(); row1.orientation = .horizontal; row1.spacing = 6
-        row1.distribution = .fillEqually
-        row1.addArrangedSubview(outlineButton("English SRT",     action: #selector(runEnglishSRT)))
-        row1.addArrangedSubview(outlineButton("Translate EN→ZH", action: #selector(translateENToZH)))
-        row1.addArrangedSubview(outlineButton("Merge ASS+Burn",  action: #selector(mergeAndBurn)))
-
-        // Row 2: Run All — full width purple
-        let runAllBtn = NSButton(title: "", target: self, action: #selector(runAll))
-        runAllBtn.isBordered = false; runAllBtn.wantsLayer = true
-        runAllBtn.layer?.backgroundColor = NSColor(red: 0.48, green: 0.25, blue: 0.90, alpha: 1).cgColor
-        runAllBtn.layer?.cornerRadius = 8
-        runAllBtn.heightAnchor.constraint(equalToConstant: 46).isActive = true
-        let runAllAttr: [NSAttributedString.Key: Any] = [
-            .font: NSFont.systemFont(ofSize: 15, weight: .semibold), .foregroundColor: NSColor.white
-        ]
-        runAllBtn.attributedTitle = NSAttributedString(string: "▶   Run All", attributes: runAllAttr)
-
-        btnGrid.addArrangedSubview(row1)
-        btnGrid.addArrangedSubview(runAllBtn)
-        leftStack.addArrangedSubview(padded(btnGrid))
-        // Bind btnGrid and its children to full width
-        if let wrapper = leftStack.arrangedSubviews.last as? NSStackView,
-           let grid = wrapper.arrangedSubviews.first as? NSStackView {
-            wrapper.translatesAutoresizingMaskIntoConstraints = false
-            wrapper.widthAnchor.constraint(equalTo: leftStack.widthAnchor).isActive = true
-            grid.translatesAutoresizingMaskIntoConstraints = false
-            grid.widthAnchor.constraint(equalTo: wrapper.widthAnchor, constant: -32).isActive = true
-            for sub in grid.arrangedSubviews {
-                sub.translatesAutoresizingMaskIntoConstraints = false
-                sub.widthAnchor.constraint(equalTo: grid.widthAnchor).isActive = true
-            }
-        }
+        leftStack.addArrangedSubview(spacer(8))
 
         // Status bar
         let statusBar = NSStackView(); statusBar.orientation = .horizontal; statusBar.spacing = 8
@@ -1700,6 +1732,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func vstack(_ views: [NSView], spacing: CGFloat) -> NSStackView {
         let s = NSStackView(views: views); s.orientation = .vertical; s.spacing = spacing
         s.alignment = .leading; return s
+    }
+
+    private func pin(_ child: NSView, to parent: NSView) {
+        child.translatesAutoresizingMaskIntoConstraints = false
+        NSLayoutConstraint.activate([
+            child.leadingAnchor.constraint(equalTo: parent.leadingAnchor),
+            child.trailingAnchor.constraint(equalTo: parent.trailingAnchor),
+            child.topAnchor.constraint(equalTo: parent.topAnchor),
+            child.bottomAnchor.constraint(equalTo: parent.bottomAnchor)
+        ])
     }
 
     private func sectionHeader(_ title: String, icon: String) -> NSView {
@@ -2034,9 +2076,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         batchJobs.append(contentsOf: newJobs)
         batchTableView.reloadData()
         log("Added \(newJobs.count) file(s) to batch queue.")
-        if let first = newJobs.first,
-           let lbl = objc_getAssociatedObject(self, &AssocKeys.fileNameLabel) as? NSTextField {
-            lbl.stringValue = first.sourceURL.lastPathComponent
+        if let first = newJobs.first {
+            if sourceField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                sourceField.stringValue = first.sourceURL.path
+            }
+            updateSelectedSourceUI(first.sourceURL)
         }
         if let badge = objc_getAssociatedObject(self, &AssocKeys.pendingBadge) as? NSTextField {
             badge.stringValue = batchJobs.isEmpty ? "" : "PENDING"
@@ -2052,6 +2096,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if panel.runModal() == .OK, let url = panel.url {
             outputField.stringValue = url.path
             Settings.outputFolder = url.path
+        }
+    }
+
+    @objc func chooseSource() {
+        let panel = NSOpenPanel()
+        if #available(macOS 12.0, *) {
+            panel.allowedContentTypes = [.mpeg4Movie, .quickTimeMovie]
+        } else {
+            panel.allowedFileTypes = ["mov", "mp4", "m4v"]
+        }
+        if panel.runModal() == .OK, let url = panel.url {
+            sourceField.stringValue = url.path
+            updateSelectedSourceUI(url)
         }
     }
 
@@ -2092,6 +2149,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         Settings.translateProvider = selectedProvider()
     }
 
+    @objc func toggleAdvanced() {
+        advancedExpanded.toggle()
+        advancedChevron.stringValue = advancedExpanded ? "▾" : "›"
+        advancedStack.isHidden = !advancedExpanded
+    }
+
     @objc func settingChanged() { saveSettings() }
 
     func chooseFile(into field: NSTextField, types: [String]?) {
@@ -2115,6 +2178,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func requireSource() throws -> URL {
+        let typedPath = sourceField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !typedPath.isEmpty {
+            guard FileManager.default.fileExists(atPath: typedPath) else { throw SubtitleError.missingFile(typedPath) }
+            return URL(fileURLWithPath: typedPath)
+        }
         // Use first queued job if batch is populated and none manually set
         if let first = batchJobs.first(where: { $0.status == .queued }) {
             return first.sourceURL
@@ -2139,6 +2207,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func selectedProvider() -> String {
         providerPopup.titleOfSelectedItem ?? "OpenAI"
+    }
+
+    func updateSelectedSourceUI(_ url: URL) {
+        if let lbl = objc_getAssociatedObject(self, &AssocKeys.fileNameLabel) as? NSTextField {
+            lbl.stringValue = url.lastPathComponent
+        }
     }
 
     func translateModel() -> String {
