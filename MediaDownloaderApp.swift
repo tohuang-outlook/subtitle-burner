@@ -157,7 +157,6 @@ final class PrimaryButton: NSButton {
             let sz = s.size()
             s.draw(at: NSPoint(x: (bounds.width - sz.width)/2, y: (bounds.height - sz.height)/2))
         } else {
-            // Draw custom download icon + label using NSBezierPath (Y=0 at bottom in NSView)
             let labelText = "Start Download"
             let attr: [NSAttributedString.Key: Any] = [
                 .font: NSFont.systemFont(ofSize: 15, weight: .semibold),
@@ -165,54 +164,10 @@ final class PrimaryButton: NSButton {
             ]
             let labelStr = NSAttributedString(string: labelText, attributes: attr)
             let labelSz  = labelStr.size()
-            let iconW: CGFloat = 22
-            let iconH: CGFloat = 22
-            let gap:   CGFloat = 10
-            let totalW = iconW + gap + labelSz.width
-            let startX = (bounds.width - totalW) / 2
-            // In NSView: Y=0 is bottom, Y=bounds.height is top
+            let startX = (bounds.width - labelSz.width) / 2
             let midY   = bounds.height / 2
 
-            // Draw label — vertically centered
-            labelStr.draw(at: NSPoint(x: startX + iconW + gap, y: midY - labelSz.height / 2))
-
-            // Icon bounding box: centered vertically
-            let ix  = startX
-            let iCX = ix + iconW / 2
-            let iBottom = midY - iconH / 2   // bottom of icon box
-            let iTop    = midY + iconH / 2   // top of icon box
-
-            NSColor.white.setStroke()
-
-            // NSView coordinate system: Y=0 is BOTTOM, Y increases UPWARD
-            // So to draw arrow pointing DOWN: tip has SMALLER Y than wings
-            // iTop = highest Y (top of icon box, top of screen)
-            // iBottom = lowest Y (bottom of icon box, bottom of screen)
-            let iconMidY = (iTop + iBottom) / 2
-
-            // Shaft from iTop down to iconMidY
-            let s = NSBezierPath()
-            s.lineWidth = 2.5; s.lineCapStyle = .round
-            s.move(to: NSPoint(x: iCX, y: iTop))
-            s.line(to: NSPoint(x: iCX, y: iconMidY))
-            s.stroke()
-
-            // Arrowhead: wings at iconMidY, tip at iconMidY-7 (lower = downward on screen)
-            let h = NSBezierPath()
-            h.lineWidth = 2.5; h.lineCapStyle = .round; h.lineJoinStyle = .round
-            h.move(to: NSPoint(x: iCX - 7, y: iconMidY))
-            h.line(to: NSPoint(x: iCX,     y: iconMidY - 7))
-            h.line(to: NSPoint(x: iCX + 7, y: iconMidY))
-            h.stroke()
-
-            // Tray at iBottom
-            let t = NSBezierPath()
-            t.lineWidth = 2.5; t.lineCapStyle = .round; t.lineJoinStyle = .round
-            t.move(to: NSPoint(x: ix,         y: iBottom + 6))
-            t.line(to: NSPoint(x: ix,         y: iBottom))
-            t.line(to: NSPoint(x: ix + iconW, y: iBottom))
-            t.line(to: NSPoint(x: ix + iconW, y: iBottom + 6))
-            t.stroke()
+            labelStr.draw(at: NSPoint(x: startX, y: midY - labelSz.height / 2))
         }
     }
 }
