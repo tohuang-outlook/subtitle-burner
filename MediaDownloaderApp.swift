@@ -233,6 +233,10 @@ final class SecondaryButton: NSButton {
     required init?(coder: NSCoder) { nil }
 }
 
+final class FlippedContainerView: NSView {
+    override var isFlipped: Bool { true }
+}
+
 // MARK: - AppDelegate
 
 final class MediaDownloaderDelegate: NSObject, NSApplicationDelegate {
@@ -249,6 +253,7 @@ final class MediaDownloaderDelegate: NSObject, NSApplicationDelegate {
     var customWidthGroup = NSStackView()
     var igIndexesField  = NSTextField()
     var igIndexesGroup  = NSStackView()
+    var advancedStateLabel = NSTextField(labelWithString: "No extra options for this selection.")
     var cookiesPopup    = NSPopUpButton()
     var ytdlpField      = NSTextField()
     var galleryDLField  = NSTextField()
@@ -401,6 +406,9 @@ final class MediaDownloaderDelegate: NSObject, NSApplicationDelegate {
     // MARK: - Left column
 
     func buildLeftColumn() -> NSScrollView {
+        let content = FlippedContainerView()
+        content.translatesAutoresizingMaskIntoConstraints = false
+
         let stack = NSStackView()
         stack.orientation = .vertical
         stack.spacing = 14
@@ -484,12 +492,24 @@ final class MediaDownloaderDelegate: NSObject, NSApplicationDelegate {
         igIndexesField.heightAnchor.constraint(equalToConstant: 42).isActive = true
         igIndexesGroup = vstack(spacing: 4, views: [microLabel("IG Indexes"), igRow2])
         advGrid.addArrangedSubview(igIndexesGroup)
+        igIndexesGroup.translatesAutoresizingMaskIntoConstraints = false
+        igIndexesGroup.widthAnchor.constraint(equalTo: advGrid.widthAnchor).isActive = true
+        igRow2.translatesAutoresizingMaskIntoConstraints = false
+        igRow2.widthAnchor.constraint(equalTo: igIndexesGroup.widthAnchor).isActive = true
+        igIndexesField.translatesAutoresizingMaskIntoConstraints = false
+        igIndexesField.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        igIndexesField.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+
+        advancedStateLabel.font = .systemFont(ofSize: 12)
+        advancedStateLabel.textColor = .wsSubtext
+        advGrid.addArrangedSubview(advancedStateLabel)
 
         stack.addArrangedSubview(advGrid)
 
         // Cookies
         stack.addArrangedSubview(microLabel("Browser Cookies"))
         cookiesPopup.addItems(withTitles: ["No cookies","Safari","Chrome","Firefox"])
+        cookiesPopup.selectItem(withTitle: "Chrome")
         cookiesPopup.wantsLayer = true
         cookiesPopup.layer?.cornerRadius = 6
         stack.addArrangedSubview(cookiesPopup)
@@ -615,13 +635,17 @@ final class MediaDownloaderDelegate: NSObject, NSApplicationDelegate {
         let scrollView = NSScrollView()
         scrollView.drawsBackground = false
         scrollView.hasVerticalScroller = true
-        scrollView.documentView = stack
+        content.addSubview(stack)
+        scrollView.documentView = content
         scrollView.contentView.backgroundColor = NSColor.wsBackground
 
-        // Make stack fill scroll width
-        stack.translatesAutoresizingMaskIntoConstraints = false
         NSLayoutConstraint.activate([
-            stack.widthAnchor.constraint(equalTo: scrollView.contentView.widthAnchor)
+            content.widthAnchor.constraint(equalTo: scrollView.contentView.widthAnchor),
+            stack.leadingAnchor.constraint(equalTo: content.leadingAnchor),
+            stack.trailingAnchor.constraint(equalTo: content.trailingAnchor),
+            stack.topAnchor.constraint(equalTo: content.topAnchor),
+            stack.bottomAnchor.constraint(lessThanOrEqualTo: content.bottomAnchor),
+            stack.widthAnchor.constraint(equalTo: content.widthAnchor)
         ])
 
         return scrollView
@@ -804,6 +828,7 @@ final class MediaDownloaderDelegate: NSObject, NSApplicationDelegate {
         DispatchQueue.main.async {
             self.igIndexesGroup.isHidden = !isIGMode
             self.customWidthGroup.isHidden = !showCustomWidth
+            self.advancedStateLabel.isHidden = isIGMode || showCustomWidth
         }
     }
 
@@ -896,6 +921,8 @@ final class MediaDownloaderDelegate: NSObject, NSApplicationDelegate {
         ytdlpField.stringValue     = d.string(forKey: Prefs.ytdlpPath)     ?? findTool("yt-dlp")
         galleryDLField.stringValue = d.string(forKey: Prefs.galleryDLPath) ?? findTool("gallery-dl")
         ffmpegField.stringValue    = d.string(forKey: Prefs.ffmpegPath)    ?? findTool("ffmpeg")
+        let savedCookies = d.string(forKey: Prefs.cookies) ?? "Chrome"
+        cookiesPopup.selectItem(withTitle: savedCookies)
         urlHistory = d.stringArray(forKey: Prefs.urlHistory) ?? []
         urlCombo.removeAllItems(); urlCombo.addItems(withObjectValues: urlHistory)
         if let fmt = d.string(forKey: Prefs.format),
@@ -916,6 +943,7 @@ final class MediaDownloaderDelegate: NSObject, NSApplicationDelegate {
         d.set(formatDefs[selectedFormat].1, forKey: Prefs.format)
         d.set(sizeDefs[selectedDLSize],    forKey: Prefs.downloadSize)
         d.set(convertDefs[selectedCvSize], forKey: Prefs.convertSize)
+        d.set(cookiesPopup.titleOfSelectedItem ?? "Chrome", forKey: Prefs.cookies)
         d.set(urlHistory, forKey: Prefs.urlHistory)
     }
 
